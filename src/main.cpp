@@ -45,7 +45,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define TRACKER_ID         "watchout01"
 #define TRACKER_INTERVAL_S 15
 
-#define FW_VERSION "v1.2"
+#define FW_VERSION "v1.3"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -1443,7 +1443,7 @@ void buildLoRa() {
 }
 
 void pollIR() {
-  if (page != IR_PAGE || !IrReceiver.decode()) return;
+  if (page != IR_PAGE || subView != 1 || !IrReceiver.decode()) return;
   auto &d = IrReceiver.decodedIRData;
   bool repeat = (d.flags & IRDATA_FLAGS_IS_REPEAT);
   bool overflow = (d.flags & IRDATA_FLAGS_WAS_OVERFLOW);
@@ -1484,7 +1484,108 @@ void replayIR() {
   lastDraw = 0;
 }
 
-void buildIR() {
+// ---------------- IR VIEWS ----------------
+// IR subView: 0 = menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
+void buildIR();
+
+const decode_type_t IR_CUSTOM_PROTOCOLS[] = {
+  NEC, SONY, SAMSUNG, LG, RC5, RC6, PANASONIC, JVC, DENON, SHARP, SANYO, WHYNTER
+};
+const int IR_CUSTOM_PROTOCOL_COUNT = 12;
+
+int irCustomProtoIdx = 0;
+uint8_t irCustomAddrDigits[4] = {0, 0, 0, 0};
+uint8_t irCustomCmdDigits[4]  = {0, 0, 0, 0};
+int irEditDigit = 0;        // which hex digit is being edited (0-3)
+bool irEditing = false;     // true = joystick up/down edits digits
+String irSendMessage = "";
+
+String irHexDigits(const uint8_t *digs, bool editing, int editPos) {
+  static const char HEXC[] = "0123456789ABCDEF";
+  String s = "0x";
+  for (int i = 0; i < 4; i++) {
+    if (editing && i == editPos) s += "[";
+    s += HEXC[digs[i] & 0x0F];
+    if (editing && i == editPos) s += "]";
+  }
+  return s;
+}
+
+uint16_t irDigitsToValue(const uint8_t *digs) {
+  return (uint16_t)((digs[0] << 12) | (digs[1] << 8) | (digs[2] << 4) | (digs[3] & 0x0F));
+}
+
+void irEditNudge(int dir) {
+  uint8_t *digs = (pageSel == 1) ? irCustomAddrDigits : irCustomCmdDigits;
+  int v = (int)digs[irEditDigit] + dir;
+  if (v < 0) v = 15;
+  if (v > 15) v = 0;
+  digs[irEditDigit] = (uint8_t)v;
+}
+
+void sendCustomIR() {
+  decode_type_t proto = IR_CUSTOM_PROTOCOLS[irCustomProtoIdx];
+  uint16_t addr = irDigitsToValue(irCustomAddrDigits);
+  uint16_t cmd  = irDigitsToValue(irCustomCmdDigits);
+
+  IrReceiver.stop();
+  bool ok = IrSender.write(proto, addr, cmd, 0);
+  if (ok) {
+    irSendMessage = "Sent OK";
+    ledFlash(255, 255, 255, 200);
+  } else {
+    irSendMessage = "Send failed";
+    ledFlash(255, 0, 0, 300);
+  }
+  IrReceiver.start();
+  lastDraw = 0;
+}
+
+void irCustomClick() {
+  if (irEditing) {
+    irEditDigit++;
+    if (irEditDigit >= 4) { irEditing = false; irEditDigit = 0; }
+    return;
+  }
+  switch (pageSel) {
+    case 0: irCustomProtoIdx = (irCustomProtoIdx + 1) % IR_CUSTOM_PROTOCOL_COUNT; break;
+    case 1:
+    case 2: irEditing = true; irEditDigit = 0; break;
+    case 3: sendCustomIR(); break;
+  }
+}
+
+void irClick() {
+  if (subView == 0) {
+    subParentSel = pageSel;
+    subView = pageSel + 1;   // 1 = Capture, 2 = Sender, 3 = Custom
+    pageSel = 0;
+    scrollPos = 0.0f;
+    irEditing = false;
+    irEditDigit = 0;
+    if (subView == 1) irMessage = "Listening...";
+    if (subView == 2) irSendMessage = irCaptured ? "Click = SEND" : "No code yet";
+    if (subView == 3) irSendMessage = "";
+  } else if (subView == 1) {
+    irMessage = "Listening...";
+  } else if (subView == 2) {
+    replayIR();
+    irSendMessage = irMessage;
+  } else if (subView == 3) {
+    irCustomClick();
+  }
+  buildIR();
+}
+
+void buildIRMenu() {
+  startLines();
+  addLine("IR Capture", irCaptured ? "HAVE CODE" : "", C_WHITE, irCaptured ? C_GREEN : C_MUTED);
+  addLine("IR Sender", irCaptured ? irProtocol : "NO CODE", C_WHITE, irCaptured ? C_CYAN : C_MUTED);
+  addLine("Custom IR", String(getProtocolString(IR_CUSTOM_PROTOCOLS[irCustomProtoIdx])), C_WHITE, C_WHITE);
+  finishLines();
+}
+
+void buildIRCapture() {
   startLines();
   addLine("Status", irCaptured ? "CAPTURED" : "LISTENING", C_MUTED, irCaptured ? C_GREEN : C_YELLOW);
   addKV("Protocol", irProtocol, C_WHITE);
@@ -1492,9 +1593,53 @@ void buildIR() {
   String c = String(irCommand, HEX); c.toUpperCase();
   addLine("Address", "0x" + a, C_MUTED, C_WHITE);
   addLine("Command", "0x" + c, C_MUTED, C_WHITE);
+  if (irCaptured) {
+    addLine("Bits", String(storedIRData.numberOfBits), C_MUTED, C_WHITE);
+    if (irRawMode) addLine("Mode", "RAW TIMINGS", C_MUTED, C_YELLOW);
+  }
   addLine("Captures", String(irCaptures), C_MUTED, C_WHITE);
   addWrapped(irMessage, C_CYAN);
   finishLines();
+}
+
+void buildIRSender() {
+  startLines();
+  if (!irCaptured) {
+    addLine("No code yet", "", C_YELLOW, C_YELLOW);
+    addWrapped("Use IR Capture first", C_MUTED);
+  } else {
+    addKV("Protocol", irProtocol, C_WHITE);
+    String a = String(irAddress, HEX); a.toUpperCase();
+    String c = String(irCommand, HEX); c.toUpperCase();
+    addLine("Address", "0x" + a, C_MUTED, C_WHITE);
+    addLine("Command", "0x" + c, C_MUTED, C_WHITE);
+    if (irRawMode) addLine("Mode", "RAW TIMINGS", C_MUTED, C_YELLOW);
+    addLine("CLICK = SEND", "", C_CYAN, C_CYAN);
+    addWrapped(irSendMessage, C_CYAN);
+  }
+  finishLines();
+}
+
+void buildIRCustom() {
+  startLines();
+  decode_type_t proto = IR_CUSTOM_PROTOCOLS[irCustomProtoIdx];
+  addLine("Protocol", String(getProtocolString(proto)), C_WHITE, C_CYAN);
+  addLine("Address", irHexDigits(irCustomAddrDigits, irEditing && pageSel == 1, irEditDigit),
+          C_WHITE, (irEditing && pageSel == 1) ? C_YELLOW : C_WHITE);
+  addLine("Command", irHexDigits(irCustomCmdDigits, irEditing && pageSel == 2, irEditDigit),
+          C_WHITE, (irEditing && pageSel == 2) ? C_YELLOW : C_WHITE);
+  addLine("> SEND NOW", "", C_CYAN, C_CYAN);
+  if (irEditing) addWrapped("Up/Dn = digit, click = next", C_MUTED);
+  else addWrapped("Click = edit / send", C_MUTED);
+  if (irSendMessage.length()) addWrapped(irSendMessage, C_CYAN);
+  finishLines();
+}
+
+void buildIR() {
+  if (subView == 1) buildIRCapture();
+  else if (subView == 2) buildIRSender();
+  else if (subView == 3) buildIRCustom();
+  else buildIRMenu();
 }
 
 String fmtUptime() {
@@ -2010,7 +2155,7 @@ void enterPage(Page p) {
     case GPS_PAGE: buildGPS(); break;
     case LORA_PAGE: startLoRa(); buildLoRa(); break;
     case SD_PAGE: runSDTest(); buildSD(); break;
-    case IR_PAGE: irStart(); buildIR(); break;
+    case IR_PAGE: irEditing = false; irStart(); buildIR(); break;
     case CLOCK_PAGE: buildClock(); break;
     case DATE_PAGE: buildDate(); break;
     case WEATHER_PAGE: wxState = 0; fetchWeather(); buildWeather(); break;
@@ -2168,7 +2313,7 @@ void singleClick() {
     case GPS_PAGE: gpsClick(); break;
     case LORA_PAGE: startLoRa(); buildLoRa(); break;
     case SD_PAGE: runSDTest(); buildSD(); break;
-    case IR_PAGE: replayIR(); break;
+    case IR_PAGE: irClick(); break;
     case CLOCK_PAGE:
     case DATE_PAGE: break;
     case WEATHER_PAGE: fetchWeather(); buildWeather(); break;
@@ -2321,11 +2466,13 @@ void pollJoystick() {
       pageSel = wifiSelectedIndex;
       scrollPos = (float)pageSel;
       buildWifiList();
-    } else if ((page == GPS_PAGE || page == CONFIG_PAGE) && subView != 0) {
+    } else if ((page == GPS_PAGE || page == CONFIG_PAGE || page == IR_PAGE) && subView != 0) {
       subView = 0;
       pageSel = subParentSel;
       scrollPos = (float)pageSel;
+      irEditing = false;
       if (page == GPS_PAGE) buildGPS();
+      else if (page == IR_PAGE) buildIR();
       else buildConfig();
     } else if (page == BLE_PAGE && bleDetailView) {
       bleDetailView = false;
@@ -2354,6 +2501,10 @@ void pollJoystick() {
         lastNavigation = now;
         uiDirty = true;
       }
+    } else if (page == IR_PAGE && subView == 3 && irEditing) {
+      irEditNudge(dir);
+      lastNavigation = now;
+      buildIR();
     } else {
       int ns = pageSel + dir;
       if (ns >= 0 && ns < lineCount) {

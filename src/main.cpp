@@ -1,11 +1,9 @@
-/*
-  WATCHOUT - ESP32-S3 N16R8
-  Display: ST7789 240x280
-*/
+
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include "esp_wifi.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <SD.h>
@@ -19,6 +17,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <qrcode.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -30,8 +29,6 @@
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // ---------------- USER SETTINGS ----------------
-#define WIFI_SSID "Hacking Device 🗝️🗝️"
-#define WIFI_PASS "Hacking Device1"
 #define WIFI_TX_POWER WIFI_POWER_11dBm
 #define DISABLE_BROWNOUT 0
 
@@ -51,7 +48,12 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define TRACKER_BEACON_S    30
 #define TRACKER_FILE        "/track.csv"
 
-#define FW_VERSION "v1.6"
+// Custom QR options
+#define QR_AP_SSID   "WatchOut-QR"   // hotspot used when no Wi-Fi is available
+#define QR_AP_PASS   "watchout123"   // min 8 characters
+#define QR_MAX_TEXT  300
+
+#define FW_VERSION "v1.8"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -155,6 +157,7 @@ enum Page : uint8_t {
   CLOCK_PAGE,
   DATE_PAGE,
   WEATHER_PAGE,
+  QR_PAGE,
   CONFIG_PAGE,
   FACE_PAGE
 };
@@ -165,12 +168,19 @@ void enterPage(Page p);
 void goBackToMenu();
 void saveSettings();
 void startLoRa();
+void buildWifi();
+void kbPress();
+void kbOpen();
+void buildQR();
+void renderQR();
+void qrBack();
+void qrNetStop();
 
 const char *menuItems[] = {
   "Wi-Fi", "Bluetooth", "GPS", "LoRa", "SD Card",
-  "IR Remote", "Clock", "Date", "Weather", "Settings"
+  "IR Remote", "Clock", "Date", "Weather", "QR Code", "Settings"
 };
-const int MENU_COUNT = 10;
+const int MENU_COUNT = 11;
 int selected = 0;
 
 const int LIST_CENTER_Y = 130;
@@ -228,17 +238,48 @@ unsigned long lastActivity = 0;
 int subView = 0;
 int subParentSel = 0;
 
-// LoRa chat keyboard (joystick controlled) is active on LORA_PAGE sub view 4
-inline bool kbActive() { return page == LORA_PAGE && subView == 4; }
+// ---------------- Wi-Fi page state ----------------
+// Wi-Fi sub views: 0 menu, 1 scan, 2 connect AP, 3 radar
+#define MAX_WIFI_ENTRIES 20
+
+int apStage = 0;            // connect AP: 0 network list, 1 password keyboard, 2 status page
+int apState = 0;            // 0 idle, 1 connecting, 2 connected, 3 failed, 5 waiting for scan to finish
+bool apHold = false;        // true = we own the Wi-Fi link, other pages must not drop it
+String apPass = "";
+bool apShowPass = false;
+String apTargetSsid = "";
+String apTryPass = "";
+String apFailMsg = "";
+String apNetMsg = "";
+unsigned long apConnStart = 0;
+int apListSel = 0;
+int apIdx[MAX_WIFI_ENTRIES];
+int apIdxCount = 0;
+int apActRow[3] = {-1, -1, -1};
+String savedSsid = "";      // last network connected through "Connect AP" (stored in flash)
+String savedPass = "";
+bool radarOn = false;
+
+// ---------------- QR page state ----------------
+// QR sub views: 0 menu, 1 fake QR list, 2 custom QR (web page)
+bool qrShowing = false;             // true = a QR code is drawn full screen
+String qrCustomText = "";           // text received from the phone (stored in flash)
+
+inline bool kbWifi() { return page == WIFI_PAGE && subView == 2 && apStage == 1; }
+// Joystick keyboard is active on LORA_PAGE sub view 4 (chat) and on the Wi-Fi password screen
+inline bool kbActive() { return (page == LORA_PAGE && subView == 4) || kbWifi(); }
+inline bool radarActive() { return page == WIFI_PAGE && subView == 3 && radarOn; }
+inline bool qrActive() { return page == QR_PAGE && qrShowing; }
 void renderKeyboard();
 void kbMove(int dx, int dy);
 void loraBack();
 bool loraLongClick();
+bool wifiLongClick();
+void wifiBack();
 
 const uint32_t NAV_MS = 150;
 const uint32_t PAGE_REFRESH_MS = 1000;
 
-#define MAX_WIFI_ENTRIES 20
 struct WifiEntry {
   String ssid;
   String bssid;
@@ -256,12 +297,20 @@ unsigned long lastWiFiStart = 0;
 const uint32_t WIFI_RESCAN_MS = 4000;
 const uint32_t WIFI_ENTRY_TTL_MS = 20000;
 
-void wifiBegin() {
+void wifiBeginTo(const String &ssid, const String &pass) {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_TX_POWER);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr);
+}
+
+// Uses the network saved by "Connect AP". Returns false if no network has been saved yet
+// (there is no built-in Wi-Fi name/password any more).
+bool wifiBegin() {
+  if (savedSsid.length() == 0) return false;
+  wifiBeginTo(savedSsid, savedPass);
+  return true;
 }
 
 #define MAX_BLE_ENTRIES 20
@@ -476,7 +525,8 @@ uint16_t appColor(int i) {
     case 6: return rgb565(50, 173, 230);
     case 7: return rgb565(255, 55, 95);
     case 8: return rgb565(255, 159, 10);
-    default: return rgb565(142, 142, 147);
+    case 9: return rgb565(90, 200, 250);     // QR Code
+    default: return rgb565(142, 142, 147);   // Settings
   }
 }
 
@@ -578,6 +628,21 @@ void drawGlyph(Adafruit_GFX *g, int i, int cx, int cy, float k, uint8_t br, uint
       };
       cloud(accent, 2);
       cloud(w, 0);
+      break;
+    }
+    case 9: {                                  // QR code: 3 finder squares + dots
+      int s = S(7);
+      int in = max(1, s - 2 * max(1, S(2)));
+      int off = max(1, S(2));
+      int fx[3] = {cx - S(11), cx + S(4), cx - S(11)};
+      int fy[3] = {cy - S(11), cy - S(11), cy + S(4)};
+      for (int f = 0; f < 3; f++) {
+        g->fillRect(fx[f], fy[f], s, s, w);
+        g->fillRect(fx[f] + off, fy[f] + off, in, in, accent);
+      }
+      g->fillRect(cx + S(4), cy + S(4), max(1, S(3)), max(1, S(3)), w);
+      g->fillRect(cx + S(8), cy + S(8), max(1, S(3)), max(1, S(3)), w);
+      g->fillRect(cx + S(8), cy + S(4), max(1, S(3)), max(1, S(3)), w);
       break;
     }
     default: {
@@ -1011,10 +1076,197 @@ void renderFace() {
   if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
 }
 
+// ======================= WI-FI RADAR =======================
+// Passive probe-request sniffer (same idea as mode 1 of the ESP8266 code).
+// Every phone/laptop that is looking for a Wi-Fi network sends probe requests;
+// each unique transmitter MAC becomes a dot on the radar. Closer = stronger RSSI = nearer the centre.
+#define RADAR_MAX 10
+struct RadarTarget {
+  uint8_t mac[6];
+  int rssi;
+  float angle;
+  unsigned long lastSeen;
+  bool active;
+};
+RadarTarget radarT[RADAR_MAX];
+portMUX_TYPE radarMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t radarPkts = 0;
+volatile bool radarBlip = false;
+uint8_t radarChan = 1;
+unsigned long radarLastHop = 0;
+unsigned long radarLastPrune = 0;
+const unsigned long RADAR_TTL_MS = 6000;
+
+static void radarRegister(const uint8_t *mac, int rssi) {
+  unsigned long now = millis();
+  portENTER_CRITICAL(&radarMux);
+  int idx = -1;
+  for (int i = 0; i < RADAR_MAX; i++) {
+    if (radarT[i].active && memcmp(radarT[i].mac, mac, 6) == 0) { idx = i; break; }
+  }
+  if (idx < 0) {
+    for (int i = 0; i < RADAR_MAX; i++) {
+      if (!radarT[i].active) { idx = i; break; }
+    }
+  }
+  if (idx < 0) {                                  // full: replace the oldest one
+    idx = 0;
+    for (int i = 1; i < RADAR_MAX; i++) {
+      if (radarT[i].lastSeen < radarT[idx].lastSeen) idx = i;
+    }
+    radarT[idx].active = false;
+  }
+  memcpy(radarT[idx].mac, mac, 6);
+  radarT[idx].rssi = rssi;
+  radarT[idx].lastSeen = now;
+  if (!radarT[idx].active) radarT[idx].angle = (float)random(360) * DEG2RAD;
+  radarT[idx].active = true;
+  portEXIT_CRITICAL(&radarMux);
+  radarPkts = radarPkts + 1;
+  radarBlip = true;
+}
+
+// Runs in the Wi-Fi task: keep it short
+static void radarSniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;
+  const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+  if (pkt->rx_ctrl.sig_len < 24) return;
+  const uint8_t *p = pkt->payload;
+  if (p[0] != 0x40) return;                       // 0x40 = probe request
+  radarRegister(&p[10], pkt->rx_ctrl.rssi);       // addr2 = transmitter MAC
+}
+
+void radarClear() {
+  portENTER_CRITICAL(&radarMux);
+  for (int i = 0; i < RADAR_MAX; i++) radarT[i].active = false;
+  portEXIT_CRITICAL(&radarMux);
+}
+
+bool radarStart() {
+  if (trackerOn) return false;                    // tracker needs the Wi-Fi link
+  if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }
+  apState = 0;
+  apHold = false;
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  radarClear();
+  radarPkts = 0;
+  radarBlip = false;
+  radarChan = 1;
+  radarLastHop = millis();
+  esp_wifi_set_promiscuous_rx_cb(&radarSniffer);
+  wifi_promiscuous_filter_t filt = {};
+  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+  esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(radarChan, WIFI_SECOND_CHAN_NONE);
+  radarOn = true;
+  return true;
+}
+
+void radarStop() {
+  if (!radarOn) return;
+  esp_wifi_set_promiscuous(false);
+  radarOn = false;
+}
+
+void pollRadar() {
+  if (!radarOn) return;
+  unsigned long now = millis();
+
+  if (now - radarLastHop >= 180) {
+    radarLastHop = now;
+    radarChan = (radarChan % 13) + 1;
+    esp_wifi_set_channel(radarChan, WIFI_SECOND_CHAN_NONE);
+  }
+  if (radarBlip) {
+    radarBlip = false;
+    ledFlash(0, 255, 0, 60);
+  }
+  if (now - radarLastPrune >= 250) {
+    radarLastPrune = now;
+    portENTER_CRITICAL(&radarMux);
+    for (int i = 0; i < RADAR_MAX; i++) {
+      if (radarT[i].active && now - radarT[i].lastSeen > RADAR_TTL_MS) radarT[i].active = false;
+    }
+    portEXIT_CRITICAL(&radarMux);
+  }
+}
+
+void renderRadar() {
+  Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
+  g->fillScreen(bgColor());
+
+  const int cx = 120, cy = 142, R = 98;
+  const uint16_t base = themeColor(C_GREEN);
+  const uint16_t ring = dimc(base, 85);
+
+  g->drawCircle(cx, cy, R / 3, ring);
+  g->drawCircle(cx, cy, (R * 2) / 3, ring);
+  g->drawCircle(cx, cy, R, ring);
+  g->drawFastHLine(cx - R, cy, 2 * R + 1, ring);
+  g->drawFastVLine(cx, cy - R, 2 * R + 1, ring);
+
+  unsigned long now = millis();
+
+  // sweep line with a fading trail
+  float sw = (float)(now % 2400UL) / 2400.0f * 6.2831853f;
+  for (int k = 6; k >= 0; k--) {
+    float a = sw - k * 0.09f;
+    g->drawLine(cx, cy, cx + (int)lroundf(cosf(a) * R), cy + (int)lroundf(sinf(a) * R),
+                dimc(base, (uint8_t)(255 - k * 34)));
+  }
+  g->fillCircle(cx, cy, 3, base);
+
+  // targets (copied under lock, the Wi-Fi task keeps writing)
+  RadarTarget snap[RADAR_MAX];
+  portENTER_CRITICAL(&radarMux);
+  memcpy(snap, radarT, sizeof(snap));
+  portEXIT_CRITICAL(&radarMux);
+
+  int active = 0;
+  int best = -100;
+  for (int i = 0; i < RADAR_MAX; i++) {
+    if (!snap[i].active) continue;
+    unsigned long age = now - snap[i].lastSeen;
+    if (age > RADAR_TTL_MS) continue;
+    active++;
+    if (snap[i].rssi > best) best = snap[i].rssi;
+
+    float t = (float)(snap[i].rssi + 95) / 60.0f;       // -95 dBm = edge, -35 dBm = centre
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    float d = (float)(R - 8) - t * (float)(R - 16);
+    int tx = cx + (int)lroundf(cosf(snap[i].angle) * d);
+    int ty = cy + (int)lroundf(sinf(snap[i].angle) * d);
+
+    int br = 255 - (int)(age * 150UL / RADAR_TTL_MS);
+    uint16_t col = dimc(themeColor(rssiColor(snap[i].rssi)), (uint8_t)br);
+    g->fillCircle(tx, ty, 4, col);
+    if (age < 600) g->drawCircle(tx, ty, 5 + (int)(age / 60), col);
+  }
+
+  // header
+  boldText(g, 12, 8, "RADAR", themeColor(C_CYAN), 2, 1);
+  String ch = "CH " + String(radarChan);
+  boldText(g, 228 - (int)ch.length() * 12, 8, ch, themeColor(C_WHITE), 2, 1);
+
+  // footer
+  boldText(g, 12, 252, "TGT " + String(active), themeColor(C_WHITE), 2, 1);
+  String rs = active ? String(best) + "dBm" : String("SWEEP");
+  boldText(g, 228 - (int)rs.length() * 12, 252, rs, themeColor(active ? rssiColor(best) : C_MUTED), 2, 1);
+
+  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+}
+
 void renderUI() {
   if (page == MENU) renderMenu();
   else if (page == FACE_PAGE) renderFace();
   else if (kbActive()) renderKeyboard();
+  else if (radarActive()) renderRadar();
+  else if (qrActive()) renderQR();
   else renderPage();
 }
 
@@ -1028,6 +1280,7 @@ void animateUI() {
     if (fabsf(target - scrollPos) < 0.01f) scrollPos = target;
     uiDirty = true;
   }
+  if (radarActive()) uiDirty = true;            // radar sweep animates continuously
   if (uiDirty) {
     uiDirty = false;
     lastFrame = now;
@@ -1102,7 +1355,8 @@ void buildWifiDetail() {
 
 void startWiFiScan() {
   if (wifiStarted) return;
-  if (!trackerOn) {
+  if (apState == 1 || apState == 5) return;       // don't scan while a connection is being made
+  if (!trackerOn && !apHold) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setTxPower(WIFI_TX_POWER);
@@ -1117,20 +1371,400 @@ void startWiFiScan() {
   }
 }
 
+// ======================= CONNECT AP =======================
+void saveWifiCreds(const String &ssid, const String &pass) {
+  Preferences tp;
+  tp.begin("watchout", false);
+  tp.putString("wssid", ssid);
+  tp.putString("wpass", pass);
+  tp.end();
+  savedSsid = ssid;
+  savedPass = pass;
+}
+
+void forgetWifiCreds() {
+  Preferences tp;
+  tp.begin("watchout", false);
+  tp.remove("wssid");
+  tp.remove("wpass");
+  tp.end();
+  savedSsid = "";
+  savedPass = "";
+}
+
+// Non-blocking: pollAP() does the real work
+void apConnect(const String &ssid, const String &pass) {
+  apTargetSsid = ssid;
+  apTryPass = pass;
+  apFailMsg = "";
+  apNetMsg = "";
+  apState = 5;
+  apHold = true;
+  apConnStart = millis();
+  apStage = 2;
+  pageSel = 0;
+  scrollPos = 0.0f;
+}
+
+void apFail(const char *msg) {
+  apState = 3;
+  apFailMsg = msg;
+  apHold = false;
+  WiFi.disconnect(false, false);
+  ledFlash(255, 0, 0, 400);
+  lastDraw = 0;
+}
+
+void apCancel() {
+  WiFi.disconnect(false, false);
+  apState = 0;
+  apHold = false;
+  apStage = 0;
+  pageSel = apListSel;
+  scrollPos = (float)pageSel;
+}
+
+void apDisconnect(bool forget) {
+  WiFi.disconnect(false, false);
+  apHold = false;
+  apState = 0;
+  apNetMsg = "";
+  if (forget) forgetWifiCreds();
+}
+
+void pollAP() {
+  if (apState != 1 && apState != 5) return;
+  unsigned long now = millis();
+
+  if (apState == 5) {                              // wait for a running scan to end, then connect
+    bool scanning = wifiStarted && WiFi.scanComplete() == WIFI_SCAN_RUNNING;
+    if (scanning && now - apConnStart < 4000) return;
+    if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }
+    WiFi.disconnect(false, false);
+    wifiBeginTo(apTargetSsid, apTryPass);
+    apState = 1;
+    apConnStart = now;
+    return;
+  }
+
+  wl_status_t st = WiFi.status();
+  unsigned long el = now - apConnStart;
+  if (st == WL_CONNECTED) {
+    apState = 2;
+    saveWifiCreds(apTargetSsid, apTryPass);
+    ledFlash(0, 255, 0, 400);
+    lastDraw = 0;
+  } else if (el > 1500 && st == WL_NO_SSID_AVAIL) {
+    apFail("Network not found");
+  } else if (el > 1500 && st == WL_CONNECT_FAILED) {
+    apFail("Wrong password?");
+  } else if (el > 15000) {
+    apFail("Timed out");
+  }
+}
+
+// 0 idle, 1 connecting, 2 connected, 3 failed
+int apView() {
+  if (apState == 1 || apState == 5) return 1;
+  if (WiFi.status() == WL_CONNECTED) return 2;
+  if (apState == 3) return 3;
+  return 0;
+}
+
+void apTestInternet() {
+  apNetMsg = "Testing...";
+  buildWifi();
+  uiDirty = false;
+  renderUI();
+
+  WiFiClient client;
+  HTTPClient http;
+  unsigned long t0 = millis();
+  if (http.begin(client, "http://connectivitycheck.gstatic.com/generate_204")) {
+    http.setConnectTimeout(4000);
+    http.setTimeout(4000);
+    int code = http.GET();
+    http.end();
+    if (code == 204) apNetMsg = "Online " + String(millis() - t0) + " ms";
+    else if (code > 0) apNetMsg = "Captive/blocked " + String(code);
+    else apNetMsg = "No internet " + String(code);
+  } else {
+    apNetMsg = "HTTP init failed";
+  }
+}
+
+void buildAPList() {
+  // one entry per SSID (strongest AP wins), hidden networks are skipped
+  apIdxCount = 0;
+  for (int i = 0; i < wifiCount; i++) {
+    if (wifiList[i].ssid.length() == 0) continue;
+    int dup = -1;
+    for (int k = 0; k < apIdxCount; k++) {
+      if (wifiList[apIdx[k]].ssid == wifiList[i].ssid) { dup = k; break; }
+    }
+    if (dup >= 0) {
+      if (wifiList[i].rssi > wifiList[apIdx[dup]].rssi) apIdx[dup] = i;
+    } else if (apIdxCount < MAX_WIFI_ENTRIES) {
+      apIdx[apIdxCount++] = i;
+    }
+  }
+
+  bool linked = WiFi.status() == WL_CONNECTED;
+  if (apState == 1 || apState == 5) addLine("Connecting...", "", C_YELLOW, C_YELLOW);
+  else if (linked) addLine(WiFi.SSID(), "ONLINE", C_WHITE, C_GREEN);
+  else addLine("Not connected", "", C_YELLOW, C_YELLOW);
+
+  if (apIdxCount == 0) addLine(wifiStarted ? "Scanning..." : "No networks", "", C_MUTED, C_MUTED);
+  for (int k = 0; k < apIdxCount; k++) {
+    WifiEntry &w = wifiList[apIdx[k]];
+    addLine(w.ssid, String(w.rssi), C_WHITE, rssiColor(w.rssi));
+  }
+  addLine("> Rescan", "", C_CYAN, C_CYAN);
+}
+
+void buildAPStatus() {
+  apActRow[0] = apActRow[1] = apActRow[2] = -1;
+  int v = apView();
+
+  if (v == 1) {
+    addLine("Connecting...", "", C_YELLOW, C_YELLOW);
+    addKV("SSID", apTargetSsid, C_WHITE);
+    addLine("Time", String((millis() - apConnStart) / 1000UL) + "s", C_MUTED, C_WHITE);
+    apActRow[0] = lineCount;
+    addLine("> Cancel", "", C_RED, C_RED);
+  } else if (v == 2) {
+    addLine("Connected", "", C_GREEN, C_GREEN);
+    addKV("SSID", WiFi.SSID(), C_WHITE);
+    addKV("IP", WiFi.localIP().toString(), C_CYAN);
+    addKV("Gateway", WiFi.gatewayIP().toString(), C_WHITE);
+    addKV("RSSI", String(WiFi.RSSI()) + " dBm", rssiColor(WiFi.RSSI()));
+    addKV("Channel", String(WiFi.channel()), C_WHITE);
+    addKV("BSSID", WiFi.BSSIDstr(), C_CYAN);
+    addKV("MAC", WiFi.macAddress(), C_CYAN);
+    if (apNetMsg.length()) {
+      addLine("Internet", "", C_MUTED, C_MUTED);
+      bool ok = apNetMsg.startsWith("Online");
+      addWrapped(apNetMsg, ok ? C_GREEN : (apNetMsg == "Testing..." ? C_YELLOW : C_RED));
+    }
+    apActRow[0] = lineCount;
+    addLine("> Test internet", "", C_CYAN, C_CYAN);
+    apActRow[1] = lineCount;
+    addLine("> Disconnect", "", C_YELLOW, C_YELLOW);
+    if (savedSsid.length()) {
+      apActRow[2] = lineCount;
+      addLine("> Forget saved", "", C_RED, C_RED);
+    }
+  } else if (v == 3) {
+    addLine("Failed", "", C_RED, C_RED);
+    addKV("SSID", apTargetSsid, C_WHITE);
+    addWrapped(apFailMsg, C_YELLOW);
+    apActRow[0] = lineCount;
+    addLine("> Retry", "", C_CYAN, C_CYAN);
+    apActRow[1] = lineCount;
+    addLine("> New password", "", C_CYAN, C_CYAN);
+  } else {
+    addLine("Not connected", "", C_YELLOW, C_YELLOW);
+    addWrapped("Pick a network", C_MUTED);
+    if (savedSsid.length()) addKV("Saved", savedSsid, C_CYAN);
+  }
+}
+
+void buildWifi() {
+  if (kbWifi()) { uiDirty = true; return; }          // password keyboard draws itself
+
+  if (subView == 1) {
+    if (wifiDetailView) buildWifiDetail();
+    else buildWifiList();
+    return;
+  }
+
+  startLines();
+  if (subView == 2) {
+    if (apStage == 2) buildAPStatus();
+    else buildAPList();
+  } else if (subView == 3) {
+    if (!radarOn) {                                   // radar is drawn by renderRadar()
+      addLine("Tracker is ON", "", C_RED, C_RED);
+      addWrapped("Stop it in GPS", C_MUTED);
+      addWrapped("to use the radar", C_MUTED);
+    }
+  } else {
+    bool linked = WiFi.status() == WL_CONNECTED;
+    String st = (apState == 1 || apState == 5) ? "..." : (linked ? "ONLINE" : "");
+    addLine("Wi-Fi Scan", "", C_WHITE, C_WHITE);
+    addLine("Connect AP", st, C_WHITE, linked ? C_GREEN : C_YELLOW);
+    addLine("Radar", "", C_WHITE, C_WHITE);
+  }
+  finishLines();
+}
+
 void pollWiFi() {
-  if (page != WIFI_PAGE || wifiDetailView) return;
+  if (page != WIFI_PAGE) return;
+  bool scanView = (subView == 1 && !wifiDetailView) || (subView == 2 && apStage == 0);
+  if (!scanView) return;
   if (wifiStarted) {
     int r = WiFi.scanComplete();
     if (r >= 0) {
       mergeWifiResults(r);
       wifiStarted = false;
-      buildWifiList();
+      buildWifi();
     } else if (r == WIFI_SCAN_FAILED) {
       wifiStarted = false;
     }
     return;
   }
   if (millis() - lastWiFiStart > WIFI_RESCAN_MS) startWiFiScan();
+}
+
+// ---- Wi-Fi page navigation ----
+void wifiKbBack() {
+  apStage = 0;
+  pageSel = apListSel;
+  scrollPos = (float)pageSel;
+  buildWifi();
+}
+
+void apConnectFromKb() {
+  if (apPass.length() == 0) {
+    chatStatus = "Empty";
+    chatStatusAt = millis();
+    return;
+  }
+  apConnect(apTargetSsid, apPass);
+}
+
+void apListClick() {
+  if (pageSel == 0) {                               // status line
+    apListSel = pageSel;
+    apStage = 2;
+    pageSel = 0;
+    scrollPos = 0.0f;
+    return;
+  }
+  int k = pageSel - 1 - (apIdxCount == 0 ? 1 : 0);  // first row is the status, then (maybe) a "Scanning" row
+  if (apIdxCount > 0 && k >= 0 && k < apIdxCount) {
+    int wi = apIdx[k];
+    if (wi >= wifiCount) return;
+    apListSel = pageSel;
+    apTargetSsid = wifiList[wi].ssid;
+    bool open = (wifiList[wi].security == WIFI_AUTH_OPEN);
+    if (open) {
+      apConnect(apTargetSsid, "");
+    } else if (savedSsid.length() && savedSsid == apTargetSsid) {
+      apConnect(apTargetSsid, savedPass);           // known network: use the saved password
+    } else {
+      apPass = "";
+      apShowPass = false;
+      apStage = 1;
+      pageSel = 0;
+      scrollPos = 0.0f;
+      kbOpen();
+    }
+  } else {
+    startWiFiScan();                                // "> Rescan"
+  }
+}
+
+void apStatusClick() {
+  int act = -1;
+  for (int j = 0; j < 3; j++) if (apActRow[j] == pageSel) act = j;
+  if (act < 0) return;
+
+  int v = apView();
+  if (v == 1) {
+    if (act == 0) apCancel();
+  } else if (v == 2) {
+    if (act == 0) {
+      apTestInternet();
+    } else if (act == 1 || act == 2) {
+      apDisconnect(act == 2);
+      apStage = 0;
+      pageSel = apListSel;
+      scrollPos = (float)pageSel;
+    }
+  } else if (v == 3) {
+    if (act == 0) {
+      apConnect(apTargetSsid, apTryPass);
+    } else if (act == 1) {
+      apPass = "";
+      apShowPass = false;
+      apStage = 1;
+      pageSel = 0;
+      scrollPos = 0.0f;
+      kbOpen();
+    }
+  }
+}
+
+void wifiEnterView(int v) {
+  subView = v;
+  pageSel = 0;
+  scrollPos = 0.0f;
+  wifiDetailView = false;
+  apStage = 0;
+  if (v == 1 || v == 2) startWiFiScan();
+  else if (v == 3) radarStart();
+}
+
+void wifiClick() {
+  if (subView == 0) {
+    if (pageSel < 3) {
+      subParentSel = pageSel;
+      wifiEnterView(pageSel + 1);
+    }
+  } else if (subView == 1) {
+    if (!wifiDetailView) {
+      if (wifiCount > 0 && pageSel < wifiCount) {
+        wifiSelectedIndex = pageSel;
+        wifiDetailView = true;
+        pageSel = 0;
+        scrollPos = 0.0f;
+      } else {
+        startWiFiScan();
+      }
+    }
+  } else if (subView == 2) {
+    if (apStage == 0) apListClick();
+    else if (apStage == 1) kbPress();
+    else apStatusClick();
+  } else if (subView == 3) {
+    if (radarOn) radarClear();
+  }
+  buildWifi();
+}
+
+void wifiBack() {
+  if (subView == 1 && wifiDetailView) {
+    wifiDetailView = false;
+    pageSel = wifiSelectedIndex;
+    scrollPos = (float)pageSel;
+    buildWifi();
+    return;
+  }
+  if (subView == 2 && apStage == 1) { wifiKbBack(); return; }
+  if (subView == 2 && apStage == 2) {
+    apStage = 0;
+    pageSel = apListSel;
+    scrollPos = (float)pageSel;
+    buildWifi();
+    return;
+  }
+  if (subView == 3) radarStop();
+  subView = 0;
+  wifiDetailView = false;
+  apStage = 0;
+  pageSel = subParentSel;
+  scrollPos = (float)pageSel;
+  buildWifi();
+}
+
+// Long press on the joystick button inside the Wi-Fi password keyboard = back
+bool wifiLongClick() {
+  if (kbWifi()) {
+    wifiKbBack();
+    return true;
+  }
+  return false;
 }
 
 void startBLEScan() {
@@ -1428,7 +2062,7 @@ void stopTracker() {
   if (trkServerUp) { webServer.stop(); trkServerUp = false; }
   if (trkMdns) { MDNS.end(); trkMdns = false; }
 #if TRACKER_USE_WIFI
-  WiFi.disconnect(false, false);
+  if (!apHold) WiFi.disconnect(false, false);
 #endif
 }
 
@@ -1562,7 +2196,7 @@ void trackerPoll() {
 #if TRACKER_USE_WIFI
   // 3) Wi-Fi is optional: only used to upload the backlog and serve the live map
   if (WiFi.status() != WL_CONNECTED) {
-    if (now - lastTrkWifiTry > 15000) {
+    if (now - lastTrkWifiTry > 15000 && apState != 1 && apState != 5) {
       lastTrkWifiTry = now;
       wifiBegin();
     }
@@ -1604,9 +2238,7 @@ void buildGPSTracker() {
   bool wifi = WiFi.status() == WL_CONNECTED;
   bool fix = gps.location.isValid() && gps.location.age() < 5000;
   addLine("Tracker", trackerOn ? "ON" : "OFF", C_WHITE, trackerOn ? C_GREEN : C_RED);
-  if (!trackerOn) {
-    addLine("Press = START", "", C_CYAN, C_CYAN);
-  } else {
+  if (trackerOn) {
 #if TRACKER_USE_WIFI
     addLine("Wi-Fi", wifi ? "ONLINE" : "OFFLINE", C_MUTED, wifi ? C_GREEN : C_YELLOW);
     if (wifi) {
@@ -1794,7 +2426,7 @@ void pollLoRa() {
   Serial.printf("LoRa packet #%lu RSSI=%d: %s\n", (unsigned long)loraPackets, loraRSSI, msg.c_str());
 }
 
-// ---------- on-screen keyboard ----------
+// ---------- on-screen keyboard (LoRa chat + Wi-Fi password) ----------
 static const char *KB_ROWS[3][3] = {
   {"qwertyuiop", "asdfghjkl",  "zxcvbnm,.?"},
   {"QWERTYUIOP", "ASDFGHJKL",  "ZXCVBNM,.?"},
@@ -1844,18 +2476,31 @@ void loraSaveCurrent() {
 }
 
 void kbPress() {
+  bool w = kbWifi();
+  String &buf = w ? apPass : chatText;
+  const int maxLen = w ? 63 : LORA_MAX_TEXT;
+
   if (kbRow < 3) {
     char ch = KB_ROWS[kbMode][kbRow][kbCol];
-    if (chatText.length() < LORA_MAX_TEXT) chatText += ch;
+    if ((int)buf.length() < maxLen) buf += ch;
     if (kbMode == 1) kbMode = 0;               // shift is one-shot
   } else {
     switch (kbCol) {
       case 0: kbMode = (kbMode + 1) % 3; { int l = kbRowLen(3); if (kbCol >= l) kbCol = l - 1; } break;
-      case 1: if (chatText.length() < LORA_MAX_TEXT) chatText += ' '; break;
-      case 2: if (chatText.length() > 0) chatText.remove(chatText.length() - 1); break;
-      case 3: if (loraSendText(chatText)) chatText = ""; break;
-      case 4: loraSaveCurrent(); break;
-      case 5: loraBack(); return;
+      case 1: if ((int)buf.length() < maxLen) buf += ' '; break;
+      case 2: if (buf.length() > 0) buf.remove(buf.length() - 1); break;
+      case 3:
+        if (w) { apConnectFromKb(); return; }
+        if (loraSendText(chatText)) chatText = "";
+        break;
+      case 4:
+        if (w) apShowPass = !apShowPass;
+        else loraSaveCurrent();
+        break;
+      case 5:
+        if (w) wifiKbBack();
+        else loraBack();
+        return;
     }
   }
   uiDirty = true;
@@ -1865,6 +2510,10 @@ void renderKeyboard() {
   Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
   g->fillScreen(bgColor());
 
+  const bool w = kbWifi();
+  const String &buf = w ? apPass : chatText;
+  const int maxLen = w ? 63 : LORA_MAX_TEXT;
+
   const uint16_t fg     = themeColor(C_WHITE);
   const uint16_t muted  = themeColor(C_MUTED);
   const uint16_t accent = themeColor(C_CYAN);
@@ -1872,18 +2521,26 @@ void renderKeyboard() {
   const uint16_t selFg  = bgColor();
 
   // header
+  String hd = w ? (String("Pass: ") + apTargetSsid) : String("Custom chat");
+  if (hd.length() > 24) hd = hd.substring(0, 24);
   g->setTextSize(1);
   g->setTextWrap(false);
   g->setTextColor(muted);
   g->setCursor(8, 8);
-  g->print("Custom chat");
-  String cnt = String(chatText.length()) + "/" + String(LORA_MAX_TEXT);
+  g->print(hd);
+  String cnt = String(buf.length()) + "/" + String(maxLen);
   g->setCursor(232 - (int)cnt.length() * 6, 8);
   g->print(cnt);
 
-  // text box (shows the last 4 lines)
+  // text box (shows the last 4 lines). Wi-Fi password is masked except the last typed key.
   g->drawRoundRect(4, 20, 232, 82, 6, accent);
-  String t = chatText + "_";
+  String shown = buf;
+  if (w && !apShowPass) {
+    shown = "";
+    for (unsigned int i = 0; i + 1 < buf.length(); i++) shown += '*';
+    if (buf.length()) shown += buf[buf.length() - 1];
+  }
+  String t = shown + "_";
   const int per = 17;
   int total = ((int)t.length() + per - 1) / per;
   int first = total > 4 ? total - 4 : 0;
@@ -1893,54 +2550,47 @@ void renderKeyboard() {
     boldText(g, 10, 26 + (l - first) * 19, t.substring(from, to), fg, 2, 1);
   }
 
-  // status / hint
-  g->setTextSize(1);
+  // status (Sent! / Saved / Empty ...)
   if (chatStatus.length() && millis() - chatStatusAt < 2500) {
     bool bad = chatStatus.indexOf("FAILED") >= 0 || chatStatus == "Empty";
+    g->setTextSize(1);
     g->setTextColor(bad ? themeColor(C_RED) : themeColor(C_GREEN));
     g->setCursor(8, 108);
     g->print(chatStatus);
-  } else {
-    g->setTextColor(muted);
-    g->setCursor(8, 108);
-    g->print("Move stick, click = type key");
   }
 
   // keys
   const char *modeLabel = kbMode == 0 ? "ABC" : (kbMode == 1 ? "123" : "abc");
-  const char *specLabel[6] = {modeLabel, "SPACE", "DEL", "SEND", "SAVE", "BACK"};
-  const uint16_t specColor[6] = {fg, fg, themeColor(C_RED), themeColor(C_GREEN), themeColor(C_YELLOW), themeColor(C_RED)};
+  const char *specLabel[6] = {modeLabel, "SPACE", "DEL", w ? "JOIN" : "SEND",
+                              w ? (apShowPass ? "HIDE" : "SHOW") : "SAVE", "BACK"};
+  const uint16_t specColor[6] = {fg, fg, themeColor(C_RED), themeColor(C_GREEN),
+                                 w ? themeColor(C_CYAN) : themeColor(C_YELLOW), themeColor(C_RED)};
 
   for (int r = 0; r < 4; r++) {
     int n = kbRowLen(r);
     int step = (r == 3) ? 38 : 22;
-    int w = step - 2;
+    int kw = step - 2;
     int x0 = (240 - n * step) / 2 + 1;
     int y = 124 + r * 30;
     for (int c = 0; c < n; c++) {
       int x = x0 + c * step;
       bool sel = (r == kbRow && c == kbCol);
-      g->fillRoundRect(x, y, w, 26, 4, sel ? accent : keyBg);
+      g->fillRoundRect(x, y, kw, 26, 4, sel ? accent : keyBg);
       if (r < 3) {
         char ch[2] = {KB_ROWS[kbMode][r][c], 0};
         g->setTextSize(2);
         g->setTextColor(sel ? selFg : fg);
-        g->setCursor(x + (w - 12) / 2 + 1, y + 5);
+        g->setCursor(x + (kw - 12) / 2 + 1, y + 5);
         g->print(ch);
       } else {
         const char *lab = specLabel[c];
         g->setTextSize(1);
         g->setTextColor(sel ? selFg : specColor[c]);
-        g->setCursor(x + (w - (int)strlen(lab) * 6) / 2, y + 9);
+        g->setCursor(x + (kw - (int)strlen(lab) * 6) / 2, y + 9);
         g->print(lab);
       }
     }
   }
-
-  g->setTextSize(1);
-  g->setTextColor(muted);
-  g->setCursor(8, 252);
-  g->print("Hold click = back");
 
   if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
 }
@@ -1965,7 +2615,6 @@ void buildLoRaStatus() {
   String m = loraMessage;
   if (m.length() > 90) m = m.substring(0, 90);
   addWrapped(m, C_CYAN);
-  addLine("Press = RE-INIT", "", C_CYAN, C_CYAN);
 }
 
 void buildLoRaChatMenu() {
@@ -1981,7 +2630,6 @@ void buildLoRaSaved() {
     addLine(savedMsg[i], justSent ? "SENT" : "", C_WHITE, C_GREEN);
   }
   addLine("+ New message", "", C_CYAN, C_CYAN);
-  addLine("Click=send Hold=del", "", C_MUTED, C_MUTED);
 }
 
 void buildLoRaRx() {
@@ -2095,6 +2743,410 @@ bool loraLongClick() {
   return false;
 }
 
+// ======================= QR CODE =======================
+// QR sub views: 0 menu (Fake QR Code / Custom QR), 1 fake QR list, 2 custom QR (phone web page)
+// A QR code is drawn black on white (always, so phone cameras can read it) by renderQR().
+
+QRCode qrCode;
+uint8_t qrBuf[700];                 // enough for version 12 (65x65 modules)
+bool qrValid = false;
+String qrCachedText = "\x01";       // text the current qrCode was made from
+
+// Smallest version (1..12) that fits the text, low error correction = most data
+bool qrMake(const String &t) {
+  qrValid = false;
+  if (t.length() == 0) return false;
+  for (uint8_t v = 1; v <= 12; v++) {
+    if (qrcode_getBufferSize(v) > sizeof(qrBuf)) break;
+    if (qrcode_initText(&qrCode, qrBuf, v, ECC_LOW, t.c_str()) == 0) {
+      qrValid = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- Fake QR codes ----
+const int FAKE_COUNT = 8;
+const char *FAKE_NAMES[FAKE_COUNT] = {
+  "Rickroll", "Free Wi-Fi", "Hello World", "Google",
+  "GitHub", "Fake Contact", "Secret Msg", "My Wi-Fi"
+};
+
+String qrEsc(const String &s) {     // escape for the WIFI:... QR format
+  String o = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\\' || c == ';' || c == ',' || c == ':' || c == '"') o += '\\';
+    o += c;
+  }
+  return o;
+}
+
+String fakePayload(int i) {
+  switch (i) {
+    case 0: return "https://youtu.be/dQw4w9WgXcQ";
+    case 1: return "WIFI:T:nopass;S:Free Wi-Fi;;";
+    case 2: return "Hello World from WATCHOUT!";
+    case 3: return "https://www.google.com";
+    case 4: return "https://github.com";
+    case 5: return "BEGIN:VCARD\nVERSION:3.0\nFN:John Doe\nTEL:+10000000000\nEMAIL:john@example.com\nEND:VCARD";
+    case 6: return "You found the secret message!";
+    default: {                                     // join the Wi-Fi saved by Connect AP
+      if (savedSsid.length() == 0) return "WIFI:T:WPA;S:Home Wi-Fi;P:password123;;";   // placeholder
+      if (savedPass.length() == 0) return "WIFI:T:nopass;S:" + qrEsc(savedSsid) + ";;";
+      return "WIFI:T:WPA;S:" + qrEsc(savedSsid) + ";P:" + qrEsc(savedPass) + ";;";
+    }
+  }
+}
+
+// ---- Custom QR (web page on the watch) ----
+WebServer qrServer(80);
+bool qrServerUp = false;
+bool qrHandlers = false;
+bool qrAP = false;                  // true = watch runs its own hotspot
+bool qrOwnsWifi = false;            // true = we started the link, we must stop it
+bool qrMdns = false;
+String qrNetMsg = "";
+int qrActRow[3] = {-1, -1, -1};
+
+static const char QR_HTML[] PROGMEM = R"HTML(<!doctype html><html><head>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WatchOut QR</title>
+<style>
+body{font-family:sans-serif;margin:0;padding:16px;background:#111;color:#fff}
+h2{margin:0 0 12px}h3{margin:22px 0 6px}
+textarea{width:100%;height:120px;box-sizing:border-box;font-size:16px;padding:10px;border-radius:10px;border:0}
+button{margin-top:10px;width:100%;padding:14px;font-size:17px;border:0;border-radius:10px;background:#0a84ff;color:#fff}
+input[type=file]{width:100%;margin-top:6px;font-size:15px}
+p{color:#aaa;font-size:14px;margin:4px 0}
+#s{margin-top:14px;font-size:16px;color:#6cf;min-height:20px}
+</style></head><body>
+<h2>WatchOut QR</h2>
+<textarea id=t maxlength=300 placeholder="Type text or a link"></textarea>
+<button onclick="send()">Send to watch</button>
+<h3>Or send a picture</h3>
+<p>Pick a picture that contains a QR code. The watch will draw it again.</p>
+<input type=file id=f accept="image/*" onchange="pic(this.files[0])">
+<canvas id=c hidden></canvas>
+<div id=s></div>
+<script>
+function st(m){document.getElementById('s').textContent=m}
+function send(){
+  var v=document.getElementById('t').value.trim();
+  if(!v){st('Type something first');return}
+  fetch('/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'t='+encodeURIComponent(v)})
+  .then(function(r){st(r.ok?'Sent to watch!':'Error '+r.status)})
+  .catch(function(){st('Connection lost')})
+}
+async function pic(file){
+  if(!file)return;
+  st('Reading picture...');
+  try{
+    var bmp=await createImageBitmap(file);
+    var sc=Math.min(1,1000/Math.max(bmp.width,bmp.height));
+    var c=document.getElementById('c');
+    c.width=Math.round(bmp.width*sc);c.height=Math.round(bmp.height*sc);
+    var x=c.getContext('2d');
+    x.drawImage(bmp,0,0,c.width,c.height);
+    var txt=null;
+    if('BarcodeDetector' in window){
+      try{
+        var r=await new BarcodeDetector({formats:['qr_code']}).detect(c);
+        if(r.length)txt=r[0].rawValue;
+      }catch(e){}
+    }
+    if(!txt){
+      if(!window.jsQR){
+        await new Promise(function(ok,no){
+          var s=document.createElement('script');
+          s.src='https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
+          s.onload=ok;s.onerror=no;document.head.appendChild(s);
+        });
+      }
+      var d=x.getImageData(0,0,c.width,c.height);
+      var q=jsQR(d.data,d.width,d.height);
+      if(q)txt=q.data;
+    }
+    if(!txt){st('No QR code found in that picture');return}
+    document.getElementById('t').value=txt;
+    send();
+  }catch(e){st('Could not read picture (the decoder needs internet on this phone)')}
+}
+</script></body></html>)HTML";
+
+void qrSaveText() {
+  Preferences tp;
+  tp.begin("watchout", false);
+  tp.putString("qrtxt", qrCustomText);
+  tp.end();
+}
+
+void qrHandleRoot() { qrServer.send_P(200, "text/html", QR_HTML); }
+
+void qrHandleSet() {
+  String t = qrServer.arg("t");
+  t.trim();
+  if (t.length() == 0) { qrServer.send(400, "text/plain", "Empty"); return; }
+  if (t.length() > QR_MAX_TEXT) t = t.substring(0, QR_MAX_TEXT);
+  qrCustomText = t;
+  qrSaveText();
+  qrServer.send(200, "text/plain", "OK");
+  ledFlash(0, 255, 0, 300);
+  if (page == QR_PAGE && subView == 2) {           // show it right away
+    qrShowing = true;
+    uiDirty = true;
+  }
+}
+
+void qrNetStop() {
+  if (qrServerUp) { qrServer.stop(); qrServerUp = false; }
+  if (qrMdns) { MDNS.end(); qrMdns = false; }
+  if (qrAP) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  } else if (qrOwnsWifi && !apHold && !trackerOn) {
+    WiFi.disconnect(false, false);
+  }
+  qrAP = false;
+  qrOwnsWifi = false;
+  qrNetMsg = "";
+}
+
+// Start the web page: saved Wi-Fi first, own hotspot as fallback (or when forced)
+void qrNetStart(bool forceAP) {
+  if (trackerOn) { qrNetMsg = "Tracker is ON"; return; }
+  qrNetStop();
+  qrNetMsg = forceAP ? "Starting hotspot..." : "Connecting Wi-Fi...";
+  buildQR();
+  uiDirty = false;
+  renderUI();
+
+  bool ok = false;
+  if (!forceAP) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }
+      if (wifiBegin()) {                           // only if a network was saved before
+        unsigned long t = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+          pumpGPS();
+          delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) qrOwnsWifi = true;
+      }
+    }
+    ok = (WiFi.status() == WL_CONNECTED);
+  }
+
+  if (!ok) {                                       // hotspot
+    if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }
+    apHold = false;
+    apState = 0;
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_AP);
+    ok = WiFi.softAP(QR_AP_SSID, QR_AP_PASS);
+    qrAP = ok;
+    qrOwnsWifi = ok;
+  }
+
+  if (!ok) { qrNetMsg = "Network failed"; return; }
+
+  if (!qrHandlers) {
+    qrServer.on("/", qrHandleRoot);
+    qrServer.on("/set", HTTP_POST, qrHandleSet);
+    qrHandlers = true;
+  }
+  qrServer.begin();
+  qrServerUp = true;
+  qrNetMsg = "";
+  if (!qrAP && MDNS.begin("watchout")) {
+    MDNS.addService("http", "tcp", 80);
+    qrMdns = true;
+  }
+  ledFlash(0, 120, 255, 300);
+}
+
+void qrPoll() {
+  if (qrServerUp) qrServer.handleClient();
+}
+
+// ---- screens ----
+void buildQRMenu() {
+  addLine("Fake QR Code", "", C_WHITE, C_WHITE);
+  addLine("Custom QR", qrCustomText.length() ? "SAVED" : "", C_WHITE, C_GREEN);
+}
+
+void buildQRFake() {
+  for (int i = 0; i < FAKE_COUNT; i++) addLine(FAKE_NAMES[i], "", C_WHITE, C_WHITE);
+}
+
+void buildQRCustom() {
+  qrActRow[0] = qrActRow[1] = qrActRow[2] = -1;
+
+  if (trackerOn) {
+    addLine("Tracker is ON", "", C_RED, C_RED);
+    addWrapped("Stop it in GPS", C_MUTED);
+    addWrapped("to use Custom QR", C_MUTED);
+    return;
+  }
+
+  if (!qrServerUp) {
+    addLine("Server", "OFF", C_MUTED, C_RED);
+    if (qrNetMsg.length()) addWrapped(qrNetMsg, C_YELLOW);
+  } else {
+    addLine("Server", "ON", C_MUTED, C_GREEN);
+    if (qrAP) {
+      addLine("Mode", "HOTSPOT", C_MUTED, C_YELLOW);
+      addKV("SSID", QR_AP_SSID, C_WHITE);
+      addKV("Pass", QR_AP_PASS, C_WHITE);
+      addKV("Open", WiFi.softAPIP().toString(), C_CYAN);
+    } else {
+      addLine("Mode", "WI-FI", C_MUTED, C_GREEN);
+      addKV("Open", WiFi.localIP().toString(), C_CYAN);
+      addKV("Or", "watchout.local", C_CYAN);
+    }
+  }
+
+  addLine("Text", "", C_MUTED, C_MUTED);
+  if (qrCustomText.length()) {
+    String t = qrCustomText;
+    if (t.length() > 54) t = t.substring(0, 54);
+    addWrapped(t, C_CYAN);
+  } else {
+    addWrapped("(none yet)", C_MUTED);
+  }
+
+  if (qrCustomText.length()) {
+    qrActRow[0] = lineCount;
+    addLine("> Show QR", "", C_GREEN, C_GREEN);
+  }
+  qrActRow[1] = lineCount;
+  addLine(qrAP ? "> Use Wi-Fi" : "> Use hotspot", "", C_CYAN, C_CYAN);
+  if (qrCustomText.length()) {
+    qrActRow[2] = lineCount;
+    addLine("> Clear text", "", C_RED, C_RED);
+  }
+}
+
+void buildQR() {
+  if (qrShowing) return;                            // QR is drawn by renderQR()
+  startLines();
+  if (subView == 1) buildQRFake();
+  else if (subView == 2) buildQRCustom();
+  else buildQRMenu();
+  finishLines();
+}
+
+String qrCurrentText(String &title) {
+  if (subView == 1) {
+    int i = pageSel;
+    if (i < 0) i = 0;
+    if (i >= FAKE_COUNT) i = FAKE_COUNT - 1;
+    title = FAKE_NAMES[i];
+    return fakePayload(i);
+  }
+  title = "Custom QR";
+  return qrCustomText;
+}
+
+void renderQR() {
+  Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
+  String title;
+  String text = qrCurrentText(title);
+  if (text != qrCachedText) {
+    qrCachedText = text;
+    qrMake(text);
+  }
+
+  g->fillScreen(0xFFFF);
+
+  if (!qrValid) {
+    g->setTextSize(2);
+    g->setTextWrap(false);
+    g->setTextColor(C_RED);
+    g->setCursor(12, 110);
+    g->print(text.length() ? "Text too long" : "No text");
+  } else {
+    int n = qrCode.size;
+    int scale = 240 / (n + 4);                      // leaves a 2 module quiet zone
+    if (scale < 1) scale = 1;
+    int px = n * scale;
+    int ox = (240 - px) / 2;
+    int oy = (252 - px) / 2;
+    if (oy < 0) oy = 0;
+    for (int y = 0; y < n; y++) {
+      for (int x = 0; x < n; x++) {
+        if (qrcode_getModule(&qrCode, x, y)) g->fillRect(ox + x * scale, oy + y * scale, scale, scale, 0x0000);
+      }
+    }
+  }
+
+  if (title.length() > 36) title = title.substring(0, 36);
+  g->setTextSize(1);
+  g->setTextWrap(false);
+  g->setTextColor(0x0000);
+  g->setCursor(max(2, (240 - (int)title.length() * 6) / 2), 262);
+  g->print(title);
+
+  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+}
+
+// ---- navigation ----
+void qrBack() {
+  if (qrShowing) {
+    qrShowing = false;
+    buildQR();
+    uiDirty = true;
+    return;
+  }
+  if (subView == 2) qrNetStop();
+  subView = 0;
+  pageSel = subParentSel;
+  scrollPos = (float)pageSel;
+  buildQR();
+}
+
+void qrClick() {
+  if (qrShowing) { qrBack(); return; }
+
+  if (subView == 0) {
+    if (pageSel < 2) {
+      subParentSel = pageSel;
+      subView = pageSel + 1;
+      pageSel = 0;
+      scrollPos = 0.0f;
+      if (subView == 2) {
+        qrNetStart(false);
+        pageSel = 0;
+        scrollPos = 0.0f;
+      }
+    }
+  } else if (subView == 1) {
+    if (pageSel < FAKE_COUNT) {
+      qrShowing = true;
+      uiDirty = true;
+      return;
+    }
+  } else if (subView == 2) {
+    int act = -1;
+    for (int j = 0; j < 3; j++) if (qrActRow[j] == pageSel) act = j;
+    if (act == 0) {
+      if (qrCustomText.length()) { qrShowing = true; uiDirty = true; return; }
+    } else if (act == 1) {
+      qrNetStart(!qrAP);
+      pageSel = 0;
+      scrollPos = 0.0f;
+    } else if (act == 2) {
+      qrCustomText = "";
+      qrSaveText();
+      pageSel = 0;
+      scrollPos = 0.0f;
+    }
+  }
+  buildQR();
+}
+
 // ======================= IR =======================
 
 // Only decode while inside IR Capture (subView 1)
@@ -2176,7 +3228,6 @@ void buildIRCapture() {
   addLine("Command", "0x" + c, C_MUTED, C_WHITE);
   addLine("Captures", String(irCaptures), C_MUTED, C_WHITE);
   addWrapped(irMessage, C_CYAN);
-  addLine("Press = CLEAR", "", C_CYAN, C_CYAN);
 }
 
 void buildIRSender() {
@@ -2193,7 +3244,6 @@ void buildIRSender() {
   }
   addLine("Sent", String(irSent), C_MUTED, C_WHITE);
   addWrapped(irSendMessage, C_CYAN);
-  addLine("Press = SEND", "", C_CYAN, C_CYAN);
 }
 
 void buildIRCustom() {
@@ -2388,7 +3438,8 @@ void buildWeather() {
     addLine("Connecting...", "", C_YELLOW, C_YELLOW);
   } else if (wxState == 2) {
     addLine("Wi-Fi failed", "", C_RED, C_RED);
-    addWrapped("Check SSID/pass", C_MUTED);
+    addWrapped("Use Wi-Fi app", C_MUTED);
+    addWrapped("> Connect AP", C_MUTED);
   } else if (wxState == 4) {
     addLine("Fetch failed", "", C_RED, C_RED);
     addLine("HTTP", String(wxHttp), C_MUTED, C_WHITE);
@@ -2425,11 +3476,12 @@ void fetchWeather() {
   renderUI();
 
   if (WiFi.status() != WL_CONNECTED) {
-    wifiBegin();
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
-      pumpGPS();
-      delay(100);
+    if (wifiBegin()) {                               // only if a network was saved before
+      unsigned long t = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+        pumpGPS();
+        delay(100);
+      }
     }
   }
 
@@ -2527,11 +3579,12 @@ void fetchPlace() {
   renderUI();
 
   if (WiFi.status() != WL_CONNECTED) {
-    wifiBegin();
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
-      pumpGPS();
-      delay(100);
+    if (wifiBegin()) {                               // only if a network was saved before
+      unsigned long t = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+        pumpGPS();
+        delay(100);
+      }
     }
   }
 
@@ -2640,7 +3693,11 @@ void ledAuto() {
 
   switch (page) {
     case MENU: c565to888(appColor(selected), r, g, b); break;
-    case WIFI_PAGE: c565to888(appColor(0), r, g, b); style = wifiStarted ? 2 : 0; period = 800; break;
+    case WIFI_PAGE:
+      if (radarOn) { r = 0; g = 255; b = 0; style = 2; period = 1200; }
+      else if (apState == 1 || apState == 5) { r = 255; g = 160; b = 0; style = 1; period = 500; }
+      else { c565to888(appColor(0), r, g, b); style = wifiStarted ? 2 : 0; period = 800; }
+      break;
     case BLE_PAGE: c565to888(appColor(1), r, g, b); period = 1500; break;
     case GPS_PAGE:
       if (gps.location.isValid() && gps.location.age() < 5000) { r = 0; g = 255; b = 0; style = 0; }
@@ -2663,6 +3720,7 @@ void ledAuto() {
       else if (wxState == 3) { c565to888(appColor(8), r, g, b); period = 3000; }
       else { r = 255; g = 0; b = 0; style = 1; period = 700; }
       break;
+    case QR_PAGE: c565to888(appColor(9), r, g, b); style = qrServerUp ? 2 : 0; period = 2500; break;
     case FACE_PAGE: r = 196; g = 134; b = 236; period = 4000; break;
     default: r = 140; g = 140; b = 150; style = 0; break;
   }
@@ -2714,14 +3772,15 @@ void enterPage(Page p) {
   scrollPos = 0.0f;
   lastClockSec = -1;
   subView = 0;
+  qrShowing = false;
 
   switch (page) {
     case MENU: drawMenu(); break;
     case WIFI_PAGE:
       wifiDetailView = false;
       wifiSelectedIndex = 0;
-      startWiFiScan();
-      buildWifiList();
+      apStage = 0;
+      buildWifi();                // starts on the Wi-Fi sub menu (Scan / Connect AP / Radar)
       break;
     case BLE_PAGE:
       bleDetailView = false;
@@ -2740,6 +3799,7 @@ void enterPage(Page p) {
     case CLOCK_PAGE: buildClock(); break;
     case DATE_PAGE: buildDate(); break;
     case WEATHER_PAGE: wxState = 0; fetchWeather(); buildWeather(); break;
+    case QR_PAGE: buildQR(); break;             // starts on the QR sub menu (Fake / Custom)
     case CONFIG_PAGE: buildConfig(); break;
     case FACE_PAGE: startLines(); lastFaceKey = 0xFFFFFFFF; break;
   }
@@ -2762,8 +3822,12 @@ void loadSettings() {
   customAddr      = prefs.getUChar("ca", 0);
   customCmd       = prefs.getUChar("cc", 0);
   customRepeats   = prefs.getUChar("cr", 0);
+  savedSsid       = prefs.getString("wssid", "");
+  savedPass       = prefs.getString("wpass", "");
+  qrCustomText    = prefs.getString("qrtxt", "");
   prefs.end();
 
+  if (qrCustomText.length() > QR_MAX_TEXT) qrCustomText = qrCustomText.substring(0, QR_MAX_TEXT);
   if (configSelection < 0 || configSelection >= BRIGHT_COUNT) configSelection = 3;
   if (oriIdx < 0 || oriIdx > 1) oriIdx = 0;
   if (dimIdx < 0 || dimIdx >= DIM_COUNT) dimIdx = 3;
@@ -2909,19 +3973,7 @@ void singleClick() {
   }
 
   switch (page) {
-    case WIFI_PAGE:
-      if (!wifiDetailView) {
-        if (wifiCount > 0) {
-          wifiSelectedIndex = pageSel;
-          wifiDetailView = true;
-          pageSel = 0;
-          scrollPos = 0.0f;
-          buildWifiDetail();
-        } else {
-          startWiFiScan();
-        }
-      }
-      break;
+    case WIFI_PAGE: wifiClick(); break;
 
     case BLE_PAGE:
       if (!bleDetailView) {
@@ -2951,6 +4003,7 @@ void singleClick() {
     case CLOCK_PAGE:
     case DATE_PAGE: break;
     case WEATHER_PAGE: fetchWeather(); buildWeather(); break;
+    case QR_PAGE: qrClick(); break;
     case CONFIG_PAGE: configClick(); break;
     case FACE_PAGE: goBackToMenu(); break;
     default: break;
@@ -2960,13 +4013,20 @@ void singleClick() {
 
 void leavePageCleanup() {
   if (page == WIFI_PAGE) {
+    radarStop();
     if (wifiStarted) WiFi.scanDelete();
     wifiStarted = false;
     wifiDetailView = false;
+    apStage = 0;
   }
   if (page == BLE_PAGE) bleDetailView = false;
   if (page == IR_PAGE) irStop();
-  if ((page == WEATHER_PAGE || page == GPS_PAGE) && !trackerOn) {
+  if (page == QR_PAGE) {
+    qrShowing = false;
+    qrNetStop();                // web server / hotspot only live inside Custom QR
+  }
+  // a link made with "Connect AP" (apHold) stays up so Weather / NTP / GPS place lookup can use it
+  if ((page == WEATHER_PAGE || page == GPS_PAGE) && !trackerOn && !apHold) {
     WiFi.disconnect(false, false);
   }
 }
@@ -3095,13 +4155,12 @@ void pollJoystick() {
   if (page != MENU && !kbActive() && rightSwipeArmed && rightHeld && now - lastRightSwipe > 350) {
     rightSwipeArmed = false;
     lastRightSwipe = now;
-    if (page == WIFI_PAGE && wifiDetailView) {
-      wifiDetailView = false;
-      pageSel = wifiSelectedIndex;
-      scrollPos = (float)pageSel;
-      buildWifiList();
+    if (page == WIFI_PAGE && subView != 0) {
+      wifiBack();
     } else if (page == LORA_PAGE && subView != 0) {
       loraBack();
+    } else if (page == QR_PAGE && (subView != 0 || qrShowing)) {
+      qrBack();
     } else if ((page == GPS_PAGE || page == CONFIG_PAGE || page == IR_PAGE) && subView != 0) {
       subView = 0;
       pageSel = subParentSel;
@@ -3172,7 +4231,7 @@ void pollJoystick() {
     btnDownAt = now;
   } else if (!down && buttonWasDown) {
     buttonWasDown = false;
-    if (now - btnDownAt >= 700 && loraLongClick()) {
+    if (now - btnDownAt >= 700 && (loraLongClick() || wifiLongClick())) {
       lastDraw = millis();
     } else {
       singleClick();
@@ -3245,14 +4304,18 @@ void loop() {
   ledUpdate();
   pollWeather();
   pollWiFi();
+  pollAP();
+  pollRadar();
   pollLoRa();
   pollIR();
   trackerPoll();
+  qrPoll();
   dimUpdate();
 
   if (page != MENU && millis() - lastDraw >= (page == CLOCK_PAGE ? (uint32_t)250 : PAGE_REFRESH_MS)) {
     lastDraw = millis();
     switch (page) {
+      case WIFI_PAGE: buildWifi(); break;
       case GPS_PAGE: buildGPS(); break;
       case LORA_PAGE: buildLoRa(); break;
       case SD_PAGE: buildSD(); break;
@@ -3260,6 +4323,7 @@ void loop() {
       case CLOCK_PAGE: buildClock(); break;
       case DATE_PAGE: buildDate(); break;
       case WEATHER_PAGE: buildWeather(); break;
+      case QR_PAGE: buildQR(); break;
       case CONFIG_PAGE: buildConfig(); break;
       case FACE_PAGE: faceUpdate(); break;
       default: break;

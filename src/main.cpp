@@ -45,7 +45,13 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define TRACKER_ID         "watchout01"
 #define TRACKER_INTERVAL_S 15
 
-#define FW_VERSION "v1.3"
+// Offline tracker options
+#define TRACKER_USE_WIFI    1      // 1 = upload/live-view when Wi-Fi is available, 0 = pure offline SD logger
+#define TRACKER_LORA_BEACON 0      // 1 = also broadcast position over LoRa (433 MHz) so another LoRa node can follow you
+#define TRACKER_BEACON_S    30
+#define TRACKER_FILE        "/track.csv"
+
+#define FW_VERSION "v1.6"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -157,6 +163,8 @@ Page page = MENU;
 
 void enterPage(Page p);
 void goBackToMenu();
+void saveSettings();
+void startLoRa();
 
 const char *menuItems[] = {
   "Wi-Fi", "Bluetooth", "GPS", "LoRa", "SD Card",
@@ -220,6 +228,13 @@ unsigned long lastActivity = 0;
 int subView = 0;
 int subParentSel = 0;
 
+// LoRa chat keyboard (joystick controlled) is active on LORA_PAGE sub view 4
+inline bool kbActive() { return page == LORA_PAGE && subView == 4; }
+void renderKeyboard();
+void kbMove(int dx, int dy);
+void loraBack();
+bool loraLongClick();
+
 const uint32_t NAV_MS = 150;
 const uint32_t PAGE_REFRESH_MS = 1000;
 
@@ -268,12 +283,46 @@ bool loraTried = false;
 uint32_t loraPackets = 0;
 int loraRSSI = 0;
 String loraMessage = "Waiting for packet";
+uint32_t loraTx = 0;
+float loraSNR = 0;
+
+// ---- LoRa Chat (joystick keyboard) ----
+// LoRa sub views: 0 menu, 1 status, 2 chat menu, 3 saved chat, 4 custom chat (keyboard), 5 received
+#define LORA_MAX_TEXT 200
+#define SAVED_MAX 10
+#define RX_MAX 10
+#define RX_SHOW_CHARS 54
+
+String savedMsg[SAVED_MAX];
+int savedCount = 0;
+int savedSentIdx = -1;
+unsigned long savedSentAt = 0;
+
+struct RxMsg {
+  String text;
+  int rssi;
+  unsigned long at;
+};
+RxMsg rxLog[RX_MAX];
+int rxCount = 0;
+int loraUnread = 0;
+int rxClearRow = -1;
+
+int loraChatSel = 0;
+String chatText = "";
+String chatStatus = "";
+unsigned long chatStatusAt = 0;
+int kbMode = 0;      // 0 abc, 1 ABC (one shot), 2 123/symbols
+int kbRow = 0;
+int kbCol = 0;
 
 bool sdOK = false;
 bool sdTried = false;
 bool sdTestOK = false;
 String sdMessage = "Not tested";
 
+// ---------------- IR STATE ----------------
+// IR sub views: 0 = IR menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
 bool irCaptured = false;
 bool irRawMode = false;
 IRData storedIRData;
@@ -284,6 +333,18 @@ String irMessage = "Listening...";
 uint16_t irAddress = 0;
 uint16_t irCommand = 0;
 uint32_t irCaptures = 0;
+String irSendMessage = "Ready";
+uint32_t irSent = 0;
+
+// Custom IR builder
+const char *CUSTOM_PROTO_NAMES[] = {"NEC", "Samsung", "Sony", "RC5", "RC6", "LG"};
+const int CUSTOM_PROTO_COUNT = 6;
+int customProto = 0;
+uint8_t customAddr = 0x00;
+uint8_t customCmd = 0x00;
+int customRepeats = 0;
+String customMessage = "Ready";
+uint32_t customSent = 0;
 
 enum LedMode : uint8_t {
   LED_OFF, LED_AUTO, LED_SOLID, LED_RAINBOW,
@@ -953,6 +1014,7 @@ void renderFace() {
 void renderUI() {
   if (page == MENU) renderMenu();
   else if (page == FACE_PAGE) renderFace();
+  else if (kbActive()) renderKeyboard();
   else renderPage();
 }
 
@@ -1216,6 +1278,94 @@ i.innerHTML=d.lat.toFixed(5)+', '+d.lon.toFixed(5)+' &middot; '+d.spd+' km/h &mi
 tick();setInterval(tick,3000);
 </script></body></html>)HTML";
 
+// ---------------- OFFLINE TRACKER ----------------
+// Every fix is appended to /track.csv on the SD card:  epoch,lat,lon,speed_knots,bearing,alt,hdop
+// If Wi-Fi is up, points not yet uploaded are sent to the Traccar server (with their real timestamps).
+bool trkSdReady = false;
+uint32_t trkOff = 0;              // byte offset in the log of the next point to upload
+uint32_t trkLogSize = 0;
+uint32_t trkLogged = 0;           // points logged this session
+uint32_t trkPending = 0;          // points logged but not uploaded yet
+uint32_t trkPendingOff = 0;
+uint8_t trkAckSinceSave = 0;
+volatile bool trkAwaiting = false;
+unsigned long lastTrkLog = 0;
+unsigned long trkRetryAt = 0;
+unsigned long lastTrkSdTry = 0;
+unsigned long lastTrkBeacon = 0;
+uint32_t trkBeacons = 0;
+
+void trkSaveOff() {
+  Preferences tp;
+  tp.begin("watchout", false);
+  tp.putUInt("tkoff", trkOff);
+  tp.end();
+  trkAckSinceSave = 0;
+}
+
+bool trackerSdMount() {
+  if (sdOK) return true;
+  digitalWrite(LORA_CS, HIGH);
+  digitalWrite(LCD_CS, HIGH);
+  sdOK = SD.begin(SD_CS, SPI, 4000000);
+  sdTried = true;
+  return sdOK;
+}
+
+void trackerPrepareLog() {
+  trkSdReady = trackerSdMount();
+  trkPending = 0;
+  if (!trkSdReady) return;
+
+  Preferences tp;
+  tp.begin("watchout", true);
+  trkOff = tp.getUInt("tkoff", 0);
+  tp.end();
+
+  File f = SD.open(TRACKER_FILE, FILE_READ);
+  if (!f) { trkLogSize = 0; trkOff = 0; return; }
+  trkLogSize = f.size();
+  if (trkOff > trkLogSize) trkOff = 0;      // card was replaced / file cleared
+  f.seek(trkOff);
+  uint8_t buf[512];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    for (int i = 0; i < n; i++) if (buf[i] == '\n') trkPending++;
+    pumpGPS();
+  }
+  f.close();
+}
+
+bool trackerEpoch(uint32_t &ep) {
+  if (!(gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024)) return false;
+  int64_t e = (int64_t)daysFromCivil(gps.date.year(), gps.date.month(), gps.date.day()) * 86400LL +
+              gps.time.hour() * 3600LL + gps.time.minute() * 60LL + gps.time.second();
+  ep = (uint32_t)e;
+  return true;
+}
+
+void trackerLogPoint() {
+  if (!trkSdReady) return;
+  uint32_t ep;
+  if (!trackerEpoch(ep)) return;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%lu,%.6f,%.6f,%.1f,%.0f,%.1f,%.1f\n",
+           (unsigned long)ep, gps.location.lat(), gps.location.lng(),
+           gps.speed.isValid() ? gps.speed.knots() : 0.0,
+           gps.course.isValid() ? gps.course.deg() : 0.0,
+           gps.altitude.isValid() ? gps.altitude.meters() : 0.0,
+           gps.hdop.isValid() ? gps.hdop.hdop() : 0.0);
+  File f = SD.open(TRACKER_FILE, FILE_APPEND);
+  if (!f) { trkSdReady = false; sdOK = false; return; }   // card lost, retry mount later
+  f.print(buf);
+  trkLogSize = f.size();
+  f.close();
+  trkLogged++;
+  trkPending++;
+}
+
+#if TRACKER_USE_WIFI
 void trackerHandleRoot() { webServer.send_P(200, "text/html", TRACK_HTML); }
 
 void trackerHandleLoc() {
@@ -1234,25 +1384,52 @@ void trackerHandleLoc() {
   webServer.send(200, "application/json", j);
 }
 
+// Download the whole SD log:  http://watchout.local/log.csv
+void trackerHandleLog() {
+  if (!trkSdReady) { webServer.send(404, "text/plain", "No SD log"); return; }
+  File f = SD.open(TRACKER_FILE, FILE_READ);
+  if (!f) { webServer.send(404, "text/plain", "No log file yet"); return; }
+  webServer.sendHeader("Content-Disposition", "attachment; filename=track.csv");
+  webServer.streamFile(f, "text/csv");
+  f.close();
+}
+#endif
+
 void startTracker() {
   trackerOn = true;
   trkServerUp = false;
   trkLastCode = 0;
   lastTrkSend = 0;
+  lastTrkLog = 0;
+  lastTrkBeacon = 0;
+  trkAwaiting = false;
+  trkRetryAt = 0;
+  trkLogged = 0;
+  trkAckSinceSave = 0;
+  trackerPrepareLog();
+#if TRACKER_USE_WIFI
   if (!trkHandlers) {
     webServer.on("/", trackerHandleRoot);
     webServer.on("/loc", trackerHandleLoc);
+    webServer.on("/log.csv", trackerHandleLog);
     trkHandlers = true;
   }
   wifiBegin();
   lastTrkWifiTry = millis();
+#endif
+#if TRACKER_LORA_BEACON
+  if (!loraOK) startLoRa();
+#endif
 }
 
 void stopTracker() {
   trackerOn = false;
+  if (trkSdReady) trkSaveOff();
   if (trkServerUp) { webServer.stop(); trkServerUp = false; }
   if (trkMdns) { MDNS.end(); trkMdns = false; }
+#if TRACKER_USE_WIFI
   WiFi.disconnect(false, false);
+#endif
 }
 
 static void trackerUploadTask(void *arg) {
@@ -1285,10 +1462,24 @@ static void trackerUploadTask(void *arg) {
   vTaskDelete(NULL);
 }
 
+bool trackerFire(const String &u) {
+  if (trkSending) return false;
+  String *url = new String(u);
+  trkSending = true;
+  if (xTaskCreate(trackerUploadTask, "trkUp", 10240, url, 1, NULL) != pdPASS) {
+    delete url;
+    trkSending = false;
+    trkLastCode = -101;
+    return false;
+  }
+  return true;
+}
+
+// Fallback when there is no SD card: send the live position only (old behaviour)
 void trackerSend() {
   if (trkSending) return;
   lastTrkSend = millis();
-  String *url = new String(
+  trackerFire(
     String(TRACKER_SERVER) + "/?id=" + TRACKER_ID +
     "&lat=" + String(gps.location.lat(), 6) +
     "&lon=" + String(gps.location.lng(), 6) +
@@ -1297,17 +1488,79 @@ void trackerSend() {
     "&altitude=" + String(gps.altitude.isValid() ? gps.altitude.meters() : 0.0, 1) +
     "&hdop=" + String(gps.hdop.isValid() ? gps.hdop.hdop() : 0.0, 1)
   );
-  trkSending = true;
-  if (xTaskCreate(trackerUploadTask, "trkUp", 10240, url, 1, NULL) != pdPASS) {
-    delete url;
-    trkSending = false;
-    trkLastCode = -101;
+}
+
+// Upload the next un-sent point from the SD log (with its original timestamp)
+void trackerSendNext() {
+  File f = SD.open(TRACKER_FILE, FILE_READ);
+  if (!f) { trkSdReady = false; sdOK = false; return; }
+  if (trkOff >= f.size()) { trkPending = 0; f.close(); return; }
+  f.seek(trkOff);
+  String line = f.readStringUntil('\n');
+  uint32_t next = f.position();
+  f.close();
+  line.trim();
+
+  unsigned long ep = 0;
+  double lat = 0, lon = 0;
+  float spd = 0, brg = 0, alt = 0, hd = 0;
+  int n = sscanf(line.c_str(), "%lu,%lf,%lf,%f,%f,%f,%f", &ep, &lat, &lon, &spd, &brg, &alt, &hd);
+  if (n != 7) {                       // damaged line: skip it
+    trkOff = next;
+    if (trkPending > 0) trkPending--;
+    return;
   }
+  trkPendingOff = next;
+  String url = String(TRACKER_SERVER) + "/?id=" + TRACKER_ID +
+               "&timestamp=" + String(ep) +
+               "&lat=" + String(lat, 6) + "&lon=" + String(lon, 6) +
+               "&speed=" + String(spd, 1) + "&bearing=" + String(brg, 0) +
+               "&altitude=" + String(alt, 1) + "&hdop=" + String(hd, 1);
+  if (trackerFire(url)) trkAwaiting = true;
+}
+
+void trackerBeacon() {
+#if TRACKER_LORA_BEACON
+  if (!loraOK) return;
+  uint32_t ep = 0;
+  trackerEpoch(ep);
+  LoRa.beginPacket();
+  LoRa.print(String("TRK,") + TRACKER_ID + "," + String(gps.location.lat(), 6) + "," +
+             String(gps.location.lng(), 6) + "," +
+             String(gps.speed.isValid() ? gps.speed.kmph() : 0.0, 1) + "," + String(ep));
+  LoRa.endPacket();
+  LoRa.receive();
+  loraTx++;
+  trkBeacons++;
+#endif
 }
 
 void trackerPoll() {
   if (!trackerOn) return;
   unsigned long now = millis();
+  bool fix = gps.location.isValid() && gps.location.age() < 5000;
+
+  // 1) always log to SD, with or without Wi-Fi
+  if (fix && now - lastTrkLog >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
+    lastTrkLog = now;
+    trackerLogPoint();
+  }
+
+  // 2) retry SD mount if the card was missing / lost
+  if (!trkSdReady && now - lastTrkSdTry > 30000) {
+    lastTrkSdTry = now;
+    trackerPrepareLog();
+  }
+
+#if TRACKER_LORA_BEACON
+  if (fix && now - lastTrkBeacon >= (unsigned long)TRACKER_BEACON_S * 1000UL) {
+    lastTrkBeacon = now;
+    trackerBeacon();
+  }
+#endif
+
+#if TRACKER_USE_WIFI
+  // 3) Wi-Fi is optional: only used to upload the backlog and serve the live map
   if (WiFi.status() != WL_CONNECTED) {
     if (now - lastTrkWifiTry > 15000) {
       lastTrkWifiTry = now;
@@ -1324,11 +1577,26 @@ void trackerPoll() {
     }
   }
   webServer.handleClient();
-  bool fix = gps.location.isValid() && gps.location.age() < 5000;
-  if (strlen(TRACKER_SERVER) > 0 && fix && !trkSending &&
-      now - lastTrkSend >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
-    trackerSend();
+
+  if (trkAwaiting && !trkSending) {
+    if (trkLastCode == 200) {
+      trkOff = trkPendingOff;
+      if (trkPending > 0) trkPending--;
+      if (++trkAckSinceSave >= 10) trkSaveOff();
+    } else {
+      trkRetryAt = now + 5000;        // server unreachable: wait and try again
+    }
+    trkAwaiting = false;
   }
+
+  if (!trkSending && !trkAwaiting && strlen(TRACKER_SERVER) > 0) {
+    if (trkSdReady) {
+      if (trkPending > 0 && now >= trkRetryAt) trackerSendNext();
+    } else if (fix && now - lastTrkSend >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
+      trackerSend();                  // no SD card: live upload only
+    }
+  }
+#endif
 }
 
 void buildGPSTracker() {
@@ -1339,20 +1607,35 @@ void buildGPSTracker() {
   if (!trackerOn) {
     addLine("Press = START", "", C_CYAN, C_CYAN);
   } else {
-    addLine("Wi-Fi", wifi ? "OK" : "CONNECTING", C_MUTED, wifi ? C_GREEN : C_YELLOW);
+#if TRACKER_USE_WIFI
+    addLine("Wi-Fi", wifi ? "ONLINE" : "OFFLINE", C_MUTED, wifi ? C_GREEN : C_YELLOW);
     if (wifi) {
       addKV("Open", WiFi.localIP().toString(), C_CYAN);
       addKV("Or", "watchout.local", C_CYAN);
     }
+#else
+    addLine("Mode", "OFFLINE", C_MUTED, C_YELLOW);
+#endif
+    addLine("SD Log", trkSdReady ? "LOGGING" : "NO SD", C_MUTED, trkSdReady ? C_GREEN : C_RED);
   }
   addLine("Fix", fix ? "VALID" : "NO FIX", C_MUTED, fix ? C_GREEN : C_YELLOW);
   addLine("Sats", String(gps.satellites.isValid() ? gps.satellites.value() : 0), C_MUTED, C_WHITE);
+  if (trackerOn && trkSdReady) {
+    addLine("Logged", String((unsigned long)trkLogged), C_MUTED, C_WHITE);
+    addLine("Pending", String((unsigned long)trkPending), C_MUTED, trkPending ? C_YELLOW : C_GREEN);
+    addLine("Log size", String((unsigned long)(trkLogSize / 1024)) + " KB", C_MUTED, C_WHITE);
+  }
+#if TRACKER_LORA_BEACON
+  addLine("Beacons", String((unsigned long)trkBeacons), C_MUTED, C_WHITE);
+#endif
+#if TRACKER_USE_WIFI
   if (strlen(TRACKER_SERVER) > 0) {
     int code = trkLastCode;
-    addLine("Sent", String((unsigned long)trkSent), C_MUTED, C_WHITE);
+    addLine("Uploaded", String((unsigned long)trkSent), C_MUTED, C_WHITE);
     addLine("Server", code == 0 ? String("--") : (code == 200 ? String("OK") : String(code)),
             C_MUTED, code == 200 ? C_GREEN : (code == 0 ? C_MUTED : C_RED));
   }
+#endif
   finishLines();
 }
 
@@ -1416,32 +1699,405 @@ void startLoRa() {
   }
 }
 
-void pollLoRa() {
-  if (page != LORA_PAGE || !loraOK) return;
-  int n = LoRa.parsePacket();
-  if (n > 0) {
-    loraMessage = "";
-    while (LoRa.available()) loraMessage += (char)LoRa.read();
-    loraPackets++;
-    ledFlash(0, 255, 0, 250);
-    loraRSSI = LoRa.packetRssi();
-    lastDraw = 0;
-    Serial.printf("LoRa packet #%lu RSSI=%d: %s\n", (unsigned long)loraPackets, loraRSSI, loraMessage.c_str());
+void buildLoRa();
+
+// ---------- saved messages (stored in flash) ----------
+void loraSavedLoad() {
+  static const char *DEF[] = {"Hello", "I am OK", "Need help", "On my way",
+                              "Where are you?", "Call me", "Yes", "No"};
+  Preferences tp;
+  tp.begin("watchout", true);
+  uint8_t n = tp.getUChar("svn", 255);
+  if (n == 255) {
+    savedCount = 8;
+    for (int i = 0; i < savedCount; i++) savedMsg[i] = DEF[i];
+  } else {
+    if (n > SAVED_MAX) n = SAVED_MAX;
+    savedCount = n;
+    for (int i = 0; i < savedCount; i++) {
+      char k[8];
+      snprintf(k, sizeof(k), "sv%d", i);
+      savedMsg[i] = tp.getString(k, "");
+    }
   }
+  tp.end();
 }
 
-void buildLoRa() {
-  startLines();
+void loraSavedStore() {
+  Preferences tp;
+  tp.begin("watchout", false);
+  tp.putUChar("svn", (uint8_t)savedCount);
+  for (int i = 0; i < savedCount; i++) {
+    char k[8];
+    snprintf(k, sizeof(k), "sv%d", i);
+    tp.putString(k, savedMsg[i]);
+  }
+  tp.end();
+}
+
+// ---------- send / receive ----------
+bool loraSendText(String text) {
+  text.trim();
+  if (text.length() == 0) { chatStatus = "Empty"; chatStatusAt = millis(); return false; }
+  if (text.length() > LORA_MAX_TEXT) text = text.substring(0, LORA_MAX_TEXT);
+  if (!loraOK) startLoRa();
+  if (!loraOK) { chatStatus = "Radio FAILED"; chatStatusAt = millis(); return false; }
+  LoRa.beginPacket();
+  LoRa.print(text);
+  LoRa.endPacket();
+  LoRa.receive();
+  loraTx++;
+  ledFlash(0, 120, 255, 200);
+  chatStatus = "Sent!";
+  chatStatusAt = millis();
+  lastDraw = 0;
+  return true;
+}
+
+void rxAdd(const String &raw, int rssi) {
+  String t = "";
+  for (unsigned int i = 0; i < raw.length(); i++) {
+    char c = raw[i];
+    if (c >= 32 && c < 127) t += c;
+  }
+  if (t.length() == 0) t = "(binary data)";
+  if (rxCount >= RX_MAX) {
+    for (int i = 0; i < RX_MAX - 1; i++) rxLog[i] = rxLog[i + 1];
+    rxCount = RX_MAX - 1;
+  }
+  rxLog[rxCount].text = t;
+  rxLog[rxCount].rssi = rssi;
+  rxLog[rxCount].at = millis();
+  rxCount++;
+}
+
+// Receives in the background as soon as the radio has been started once
+void pollLoRa() {
+  if (!loraOK) return;
+  static unsigned long lastPoll = 0;
+  unsigned long now = millis();
+  if (now - lastPoll < 25) return;
+  lastPoll = now;
+
+  int n = LoRa.parsePacket();
+  if (n <= 0) return;
+  String msg = "";
+  while (LoRa.available()) msg += (char)LoRa.read();
+  loraMessage = msg;
+  loraPackets++;
+  loraRSSI = LoRa.packetRssi();
+  loraSNR = LoRa.packetSnr();
+  rxAdd(msg, loraRSSI);
+  if (!(page == LORA_PAGE && subView == 5)) loraUnread++;
+  ledFlash(0, 255, 0, 250);
+  lastDraw = 0;
+  Serial.printf("LoRa packet #%lu RSSI=%d: %s\n", (unsigned long)loraPackets, loraRSSI, msg.c_str());
+}
+
+// ---------- on-screen keyboard ----------
+static const char *KB_ROWS[3][3] = {
+  {"qwertyuiop", "asdfghjkl",  "zxcvbnm,.?"},
+  {"QWERTYUIOP", "ASDFGHJKL",  "ZXCVBNM,.?"},
+  {"1234567890", "@#&-+=()/%", "!.,:;'\"*_~"}
+};
+
+int kbRowLen(int r) { return r == 3 ? 6 : (int)strlen(KB_ROWS[kbMode][r]); }
+
+void kbMove(int dx, int dy) {
+  int len = kbRowLen(kbRow);
+  if (dx != 0) {
+    kbCol = (kbCol + dx + len) % len;
+  } else if (dy != 0) {
+    int nr = kbRow + dy;
+    if (nr < 0) nr = 3;
+    if (nr > 3) nr = 0;
+    int nl = kbRowLen(nr);
+    kbCol = (kbCol * nl) / len;
+    if (kbCol >= nl) kbCol = nl - 1;
+    kbRow = nr;
+  }
+  uiDirty = true;
+}
+
+void kbOpen() {
+  kbMode = 0;
+  kbRow = 0;
+  kbCol = 0;
+  chatStatus = "";
+}
+
+void loraSaveCurrent() {
+  String t = chatText;
+  t.trim();
+  if (t.length() == 0) { chatStatus = "Empty"; chatStatusAt = millis(); return; }
+  for (int i = 0; i < savedCount; i++) {
+    if (savedMsg[i] == t) { chatStatus = "Already saved"; chatStatusAt = millis(); return; }
+  }
+  if (savedCount >= SAVED_MAX) {
+    for (int i = 0; i < SAVED_MAX - 1; i++) savedMsg[i] = savedMsg[i + 1];
+    savedCount = SAVED_MAX - 1;
+  }
+  savedMsg[savedCount++] = t;
+  loraSavedStore();
+  chatStatus = "Saved";
+  chatStatusAt = millis();
+}
+
+void kbPress() {
+  if (kbRow < 3) {
+    char ch = KB_ROWS[kbMode][kbRow][kbCol];
+    if (chatText.length() < LORA_MAX_TEXT) chatText += ch;
+    if (kbMode == 1) kbMode = 0;               // shift is one-shot
+  } else {
+    switch (kbCol) {
+      case 0: kbMode = (kbMode + 1) % 3; { int l = kbRowLen(3); if (kbCol >= l) kbCol = l - 1; } break;
+      case 1: if (chatText.length() < LORA_MAX_TEXT) chatText += ' '; break;
+      case 2: if (chatText.length() > 0) chatText.remove(chatText.length() - 1); break;
+      case 3: if (loraSendText(chatText)) chatText = ""; break;
+      case 4: loraSaveCurrent(); break;
+      case 5: loraBack(); return;
+    }
+  }
+  uiDirty = true;
+}
+
+void renderKeyboard() {
+  Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
+  g->fillScreen(bgColor());
+
+  const uint16_t fg     = themeColor(C_WHITE);
+  const uint16_t muted  = themeColor(C_MUTED);
+  const uint16_t accent = themeColor(C_CYAN);
+  const uint16_t keyBg  = lightMode ? 0xDEFB : 0x2104;
+  const uint16_t selFg  = bgColor();
+
+  // header
+  g->setTextSize(1);
+  g->setTextWrap(false);
+  g->setTextColor(muted);
+  g->setCursor(8, 8);
+  g->print("Custom chat");
+  String cnt = String(chatText.length()) + "/" + String(LORA_MAX_TEXT);
+  g->setCursor(232 - (int)cnt.length() * 6, 8);
+  g->print(cnt);
+
+  // text box (shows the last 4 lines)
+  g->drawRoundRect(4, 20, 232, 82, 6, accent);
+  String t = chatText + "_";
+  const int per = 17;
+  int total = ((int)t.length() + per - 1) / per;
+  int first = total > 4 ? total - 4 : 0;
+  for (int l = first; l < total; l++) {
+    int from = l * per;
+    int to = min((int)t.length(), from + per);
+    boldText(g, 10, 26 + (l - first) * 19, t.substring(from, to), fg, 2, 1);
+  }
+
+  // status / hint
+  g->setTextSize(1);
+  if (chatStatus.length() && millis() - chatStatusAt < 2500) {
+    bool bad = chatStatus.indexOf("FAILED") >= 0 || chatStatus == "Empty";
+    g->setTextColor(bad ? themeColor(C_RED) : themeColor(C_GREEN));
+    g->setCursor(8, 108);
+    g->print(chatStatus);
+  } else {
+    g->setTextColor(muted);
+    g->setCursor(8, 108);
+    g->print("Move stick, click = type key");
+  }
+
+  // keys
+  const char *modeLabel = kbMode == 0 ? "ABC" : (kbMode == 1 ? "123" : "abc");
+  const char *specLabel[6] = {modeLabel, "SPACE", "DEL", "SEND", "SAVE", "BACK"};
+  const uint16_t specColor[6] = {fg, fg, themeColor(C_RED), themeColor(C_GREEN), themeColor(C_YELLOW), themeColor(C_RED)};
+
+  for (int r = 0; r < 4; r++) {
+    int n = kbRowLen(r);
+    int step = (r == 3) ? 38 : 22;
+    int w = step - 2;
+    int x0 = (240 - n * step) / 2 + 1;
+    int y = 124 + r * 30;
+    for (int c = 0; c < n; c++) {
+      int x = x0 + c * step;
+      bool sel = (r == kbRow && c == kbCol);
+      g->fillRoundRect(x, y, w, 26, 4, sel ? accent : keyBg);
+      if (r < 3) {
+        char ch[2] = {KB_ROWS[kbMode][r][c], 0};
+        g->setTextSize(2);
+        g->setTextColor(sel ? selFg : fg);
+        g->setCursor(x + (w - 12) / 2 + 1, y + 5);
+        g->print(ch);
+      } else {
+        const char *lab = specLabel[c];
+        g->setTextSize(1);
+        g->setTextColor(sel ? selFg : specColor[c]);
+        g->setCursor(x + (w - (int)strlen(lab) * 6) / 2, y + 9);
+        g->print(lab);
+      }
+    }
+  }
+
+  g->setTextSize(1);
+  g->setTextColor(muted);
+  g->setCursor(8, 252);
+  g->print("Hold click = back");
+
+  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+}
+
+// ---------- screens ----------
+String ageStr(unsigned long ms) {
+  unsigned long s = ms / 1000UL;
+  if (s < 5) return "now";
+  if (s < 60) return String(s) + "s ago";
+  if (s < 3600) return String(s / 60) + "m ago";
+  return String(s / 3600) + "h ago";
+}
+
+void buildLoRaStatus() {
   addLine("Radio", loraOK ? "READY" : "FAILED", C_MUTED, loraOK ? C_GREEN : C_RED);
-  addLine("Packets", String(loraPackets), C_MUTED, C_WHITE);
+  addLine("Freq", String((int)(LORA_FREQ / 1E6)) + " MHz", C_MUTED, C_WHITE);
+  addLine("Received", String(loraPackets), C_MUTED, C_WHITE);
+  addLine("Sent", String(loraTx), C_MUTED, C_WHITE);
   addLine("RSSI", String(loraRSSI) + " dBm", C_MUTED, C_WHITE);
+  addLine("SNR", String(loraSNR, 1) + " dB", C_MUTED, C_WHITE);
   addLine("Last packet", "", C_MUTED, C_MUTED);
   String m = loraMessage;
   if (m.length() > 90) m = m.substring(0, 90);
   addWrapped(m, C_CYAN);
+  addLine("Press = RE-INIT", "", C_CYAN, C_CYAN);
+}
+
+void buildLoRaChatMenu() {
+  addLine("Saved chat", String(savedCount), C_WHITE, C_MUTED);
+  addLine("Custom chat", "", C_WHITE, C_WHITE);
+  if (loraUnread > 0) addLine("Received msg", String(loraUnread) + " new", C_WHITE, C_GREEN);
+  else addLine("Received msg", rxCount ? String(rxCount) : String(""), C_WHITE, C_MUTED);
+}
+
+void buildLoRaSaved() {
+  for (int i = 0; i < savedCount; i++) {
+    bool justSent = (i == savedSentIdx && millis() - savedSentAt < 1500);
+    addLine(savedMsg[i], justSent ? "SENT" : "", C_WHITE, C_GREEN);
+  }
+  addLine("+ New message", "", C_CYAN, C_CYAN);
+  addLine("Click=send Hold=del", "", C_MUTED, C_MUTED);
+}
+
+void buildLoRaRx() {
+  rxClearRow = -1;
+  if (rxCount == 0) {
+    addWrapped("No messages yet", C_MUTED);
+    return;
+  }
+  for (int i = rxCount - 1; i >= 0; i--) {
+    addLine(ageStr(millis() - rxLog[i].at), String(rxLog[i].rssi), C_YELLOW, rssiColor(rxLog[i].rssi));
+    String t = rxLog[i].text;
+    if (t.length() > RX_SHOW_CHARS) t = t.substring(0, RX_SHOW_CHARS);
+    addWrapped(t, C_CYAN);
+  }
+  rxClearRow = lineCount;
+  addLine("> Clear all", "", C_RED, C_RED);
+}
+
+void buildLoRa() {
+  startLines();
+  switch (subView) {
+    case 1: buildLoRaStatus(); break;
+    case 2: buildLoRaChatMenu(); break;
+    case 3: buildLoRaSaved(); break;
+    case 4: uiDirty = true; break;            // keyboard is drawn by renderKeyboard()
+    case 5: buildLoRaRx(); break;
+    default:
+      addLine("LoRa Status", loraOK ? "READY" : "FAILED", C_WHITE, loraOK ? C_GREEN : C_RED);
+      addLine("Chat", loraUnread > 0 ? String(loraUnread) + " new" : String(""), C_WHITE, C_GREEN);
+      break;
+  }
   finishLines();
 }
 
+// ---------- navigation ----------
+void loraBack() {
+  if (subView >= 3) {
+    subView = 2;
+    pageSel = loraChatSel;
+  } else {
+    subView = 0;
+    pageSel = subParentSel;
+  }
+  scrollPos = (float)pageSel;
+  buildLoRa();
+}
+
+void loraEnterView(int v) {
+  subView = v;
+  pageSel = 0;
+  scrollPos = 0.0f;
+  if (v == 3) loraSavedLoad();
+  if (v == 4) kbOpen();
+  if (v == 5) loraUnread = 0;
+}
+
+void loraClick() {
+  if (subView == 0) {
+    subParentSel = pageSel;
+    if (pageSel == 0) {
+      loraEnterView(1);
+    } else {
+      if (!loraOK) startLoRa();
+      loraSavedLoad();
+      loraEnterView(2);
+    }
+  } else if (subView == 1) {
+    startLoRa();
+  } else if (subView == 2) {
+    loraChatSel = pageSel;
+    loraEnterView(3 + pageSel);
+  } else if (subView == 3) {
+    if (pageSel < savedCount) {
+      if (loraSendText(savedMsg[pageSel])) {
+        savedSentIdx = pageSel;
+        savedSentAt = millis();
+      }
+    } else if (pageSel == savedCount) {
+      loraEnterView(4);
+    }
+  } else if (subView == 4) {
+    kbPress();
+  } else if (subView == 5) {
+    if (rxClearRow >= 0 && pageSel == rxClearRow) {
+      rxCount = 0;
+      loraUnread = 0;
+      pageSel = 0;
+      scrollPos = 0.0f;
+    }
+  }
+  buildLoRa();
+}
+
+// Long press on the joystick button: delete saved message / leave keyboard
+bool loraLongClick() {
+  if (page != LORA_PAGE) return false;
+  if (subView == 3) {
+    if (pageSel < savedCount) {
+      for (int i = pageSel; i < savedCount - 1; i++) savedMsg[i] = savedMsg[i + 1];
+      savedCount--;
+      loraSavedStore();
+      ledFlash(255, 0, 0, 200);
+      buildLoRa();
+    }
+    return true;
+  }
+  if (subView == 4) {
+    loraBack();
+    return true;
+  }
+  return false;
+}
+
+// ======================= IR =======================
+
+// Only decode while inside IR Capture (subView 1)
 void pollIR() {
   if (page != IR_PAGE || subView != 1 || !IrReceiver.decode()) return;
   auto &d = IrReceiver.decodedIRData;
@@ -1464,182 +2120,107 @@ void pollIR() {
     irAddress = d.address;
     irCommand = d.command;
     irMessage = "Captured";
+    irSendMessage = "Ready";
     lastDraw = 0;
   }
   IrReceiver.resume();
 }
 
+// Send the last captured code (IR Sender)
 void replayIR() {
   if (!irCaptured) {
-    irMessage = "No code yet";
+    irSendMessage = "Capture first";
     lastDraw = 0;
     return;
   }
-  IrReceiver.stop();
+  // receiver is stopped while in the Sender view, so just transmit
   if (irRawMode) IrSender.sendRaw(rawIRCode, rawIRLength, 38);
   else IrSender.write(&storedIRData);
-  irMessage = "Code sent";
+  irSent++;
+  irSendMessage = "Code sent";
   ledFlash(255, 255, 255, 200);
-  IrReceiver.start();
   lastDraw = 0;
 }
 
-// ---------------- IR VIEWS ----------------
-// IR subView: 0 = menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
-void buildIR();
-
-const decode_type_t IR_CUSTOM_PROTOCOLS[] = {
-  NEC, SONY, SAMSUNG, LG, RC5, RC6, PANASONIC, JVC, DENON, SHARP, SANYO, WHYNTER
-};
-const int IR_CUSTOM_PROTOCOL_COUNT = 12;
-
-int irCustomProtoIdx = 0;
-uint8_t irCustomAddrDigits[4] = {0, 0, 0, 0};
-uint8_t irCustomCmdDigits[4]  = {0, 0, 0, 0};
-int irEditDigit = 0;        // which hex digit is being edited (0-3)
-bool irEditing = false;     // true = joystick up/down edits digits
-String irSendMessage = "";
-
-String irHexDigits(const uint8_t *digs, bool editing, int editPos) {
-  static const char HEXC[] = "0123456789ABCDEF";
-  String s = "0x";
-  for (int i = 0; i < 4; i++) {
-    if (editing && i == editPos) s += "[";
-    s += HEXC[digs[i] & 0x0F];
-    if (editing && i == editPos) s += "]";
-  }
-  return s;
-}
-
-uint16_t irDigitsToValue(const uint8_t *digs) {
-  return (uint16_t)((digs[0] << 12) | (digs[1] << 8) | (digs[2] << 4) | (digs[3] & 0x0F));
-}
-
-void irEditNudge(int dir) {
-  uint8_t *digs = (pageSel == 1) ? irCustomAddrDigits : irCustomCmdDigits;
-  int v = (int)digs[irEditDigit] + dir;
-  if (v < 0) v = 15;
-  if (v > 15) v = 0;
-  digs[irEditDigit] = (uint8_t)v;
-}
-
+// Send the code built in Custom IR
 void sendCustomIR() {
-  decode_type_t proto = IR_CUSTOM_PROTOCOLS[irCustomProtoIdx];
-  uint16_t addr = irDigitsToValue(irCustomAddrDigits);
-  uint16_t cmd  = irDigitsToValue(irCustomCmdDigits);
-
-  IrReceiver.stop();
-  bool ok = IrSender.write(proto, addr, cmd, 0);
-  if (ok) {
-    irSendMessage = "Sent OK";
-    ledFlash(255, 255, 255, 200);
-  } else {
-    irSendMessage = "Send failed";
-    ledFlash(255, 0, 0, 300);
+  int rep = customRepeats;
+  switch (customProto) {
+    case 0: IrSender.sendNEC(customAddr, customCmd, rep); break;
+    case 1: IrSender.sendSamsung(customAddr, customCmd, rep); break;
+    case 2: IrSender.sendSony(customAddr, customCmd, rep < 2 ? 2 : rep, SIRCS_12_PROTOCOL); break;
+    case 3: IrSender.sendRC5(customAddr, customCmd, rep); break;
+    case 4: IrSender.sendRC6(customAddr, customCmd, rep); break;
+    case 5: IrSender.sendLG(customAddr, customCmd, rep); break;
+    default: break;
   }
-  IrReceiver.start();
+  customSent++;
+  customMessage = "Code sent";
+  ledFlash(255, 255, 255, 200);
   lastDraw = 0;
 }
 
-void irCustomClick() {
-  if (irEditing) {
-    irEditDigit++;
-    if (irEditDigit >= 4) { irEditing = false; irEditDigit = 0; }
-    return;
-  }
-  switch (pageSel) {
-    case 0: irCustomProtoIdx = (irCustomProtoIdx + 1) % IR_CUSTOM_PROTOCOL_COUNT; break;
-    case 1:
-    case 2: irEditing = true; irEditDigit = 0; break;
-    case 3: sendCustomIR(); break;
-  }
-}
-
-void irClick() {
-  if (subView == 0) {
-    subParentSel = pageSel;
-    subView = pageSel + 1;   // 1 = Capture, 2 = Sender, 3 = Custom
-    pageSel = 0;
-    scrollPos = 0.0f;
-    irEditing = false;
-    irEditDigit = 0;
-    if (subView == 1) irMessage = "Listening...";
-    if (subView == 2) irSendMessage = irCaptured ? "Click = SEND" : "No code yet";
-    if (subView == 3) irSendMessage = "";
-  } else if (subView == 1) {
-    irMessage = "Listening...";
-  } else if (subView == 2) {
-    replayIR();
-    irSendMessage = irMessage;
-  } else if (subView == 3) {
-    irCustomClick();
-  }
-  buildIR();
-}
-
-void buildIRMenu() {
-  startLines();
-  addLine("IR Capture", irCaptured ? "HAVE CODE" : "", C_WHITE, irCaptured ? C_GREEN : C_MUTED);
-  addLine("IR Sender", irCaptured ? irProtocol : "NO CODE", C_WHITE, irCaptured ? C_CYAN : C_MUTED);
-  addLine("Custom IR", String(getProtocolString(IR_CUSTOM_PROTOCOLS[irCustomProtoIdx])), C_WHITE, C_WHITE);
-  finishLines();
+String hex2(uint8_t v) {
+  String s = String(v, HEX);
+  s.toUpperCase();
+  if (s.length() < 2) s = "0" + s;
+  return "0x" + s;
 }
 
 void buildIRCapture() {
-  startLines();
   addLine("Status", irCaptured ? "CAPTURED" : "LISTENING", C_MUTED, irCaptured ? C_GREEN : C_YELLOW);
   addKV("Protocol", irProtocol, C_WHITE);
   String a = String(irAddress, HEX); a.toUpperCase();
   String c = String(irCommand, HEX); c.toUpperCase();
   addLine("Address", "0x" + a, C_MUTED, C_WHITE);
   addLine("Command", "0x" + c, C_MUTED, C_WHITE);
-  if (irCaptured) {
-    addLine("Bits", String(storedIRData.numberOfBits), C_MUTED, C_WHITE);
-    if (irRawMode) addLine("Mode", "RAW TIMINGS", C_MUTED, C_YELLOW);
-  }
   addLine("Captures", String(irCaptures), C_MUTED, C_WHITE);
   addWrapped(irMessage, C_CYAN);
-  finishLines();
+  addLine("Press = CLEAR", "", C_CYAN, C_CYAN);
 }
 
 void buildIRSender() {
-  startLines();
-  if (!irCaptured) {
-    addLine("No code yet", "", C_YELLOW, C_YELLOW);
-    addWrapped("Use IR Capture first", C_MUTED);
-  } else {
+  addLine("Saved", irCaptured ? "YES" : "EMPTY", C_MUTED, irCaptured ? C_GREEN : C_RED);
+  if (irCaptured) {
     addKV("Protocol", irProtocol, C_WHITE);
     String a = String(irAddress, HEX); a.toUpperCase();
     String c = String(irCommand, HEX); c.toUpperCase();
     addLine("Address", "0x" + a, C_MUTED, C_WHITE);
     addLine("Command", "0x" + c, C_MUTED, C_WHITE);
-    if (irRawMode) addLine("Mode", "RAW TIMINGS", C_MUTED, C_YELLOW);
-    addLine("CLICK = SEND", "", C_CYAN, C_CYAN);
-    addWrapped(irSendMessage, C_CYAN);
+    addLine("Mode", irRawMode ? "RAW" : "DECODED", C_MUTED, C_WHITE);
+  } else {
+    addWrapped("Use IR Capture", C_MUTED);
   }
-  finishLines();
+  addLine("Sent", String(irSent), C_MUTED, C_WHITE);
+  addWrapped(irSendMessage, C_CYAN);
+  addLine("Press = SEND", "", C_CYAN, C_CYAN);
 }
 
 void buildIRCustom() {
-  startLines();
-  decode_type_t proto = IR_CUSTOM_PROTOCOLS[irCustomProtoIdx];
-  addLine("Protocol", String(getProtocolString(proto)), C_WHITE, C_CYAN);
-  addLine("Address", irHexDigits(irCustomAddrDigits, irEditing && pageSel == 1, irEditDigit),
-          C_WHITE, (irEditing && pageSel == 1) ? C_YELLOW : C_WHITE);
-  addLine("Command", irHexDigits(irCustomCmdDigits, irEditing && pageSel == 2, irEditDigit),
-          C_WHITE, (irEditing && pageSel == 2) ? C_YELLOW : C_WHITE);
-  addLine("> SEND NOW", "", C_CYAN, C_CYAN);
-  if (irEditing) addWrapped("Up/Dn = digit, click = next", C_MUTED);
-  else addWrapped("Click = edit / send", C_MUTED);
-  if (irSendMessage.length()) addWrapped(irSendMessage, C_CYAN);
-  finishLines();
+  addLine("Protocol", CUSTOM_PROTO_NAMES[customProto], C_WHITE, C_CYAN);
+  addLine("Address +16", hex2(customAddr), C_WHITE, C_CYAN);
+  addLine("Address +1", hex2(customAddr), C_WHITE, C_CYAN);
+  addLine("Command +16", hex2(customCmd), C_WHITE, C_CYAN);
+  addLine("Command +1", hex2(customCmd), C_WHITE, C_CYAN);
+  addLine("Repeats", String(customRepeats), C_WHITE, C_CYAN);
+  addLine("> SEND", "", C_GREEN, C_GREEN);
+  addLine("Sent", String(customSent), C_MUTED, C_WHITE);
+  addWrapped(customMessage, C_CYAN);
 }
 
 void buildIR() {
-  if (subView == 1) buildIRCapture();
-  else if (subView == 2) buildIRSender();
-  else if (subView == 3) buildIRCustom();
-  else buildIRMenu();
+  startLines();
+  switch (subView) {
+    case 1: buildIRCapture(); break;
+    case 2: buildIRSender(); break;
+    case 3: buildIRCustom(); break;
+    default:
+      addLine("IR Capture", "", C_WHITE, C_WHITE);
+      addLine("IR Sender", irCaptured ? "READY" : "EMPTY", C_WHITE, irCaptured ? C_GREEN : C_MUTED);
+      addLine("Custom IR", "", C_WHITE, C_WHITE);
+      break;
+  }
+  finishLines();
 }
 
 String fmtUptime() {
@@ -2074,7 +2655,7 @@ void ledAuto() {
       if (sdTestOK) { r = 0; g = 255; b = 0; style = 0; }
       else { r = 255; g = 0; b = 0; style = 1; period = 600; }
       break;
-    case IR_PAGE: c565to888(appColor(5), r, g, b); style = irCaptured ? 0 : 2; period = 1500; break;
+    case IR_PAGE: c565to888(appColor(5), r, g, b); style = (subView == 1 && !irCaptured) ? 2 : 0; period = 1500; break;
     case CLOCK_PAGE: c565to888(appColor(6), r, g, b); period = 4000; break;
     case DATE_PAGE: c565to888(appColor(7), r, g, b); style = 0; break;
     case WEATHER_PAGE:
@@ -2155,7 +2736,7 @@ void enterPage(Page p) {
     case GPS_PAGE: buildGPS(); break;
     case LORA_PAGE: startLoRa(); buildLoRa(); break;
     case SD_PAGE: runSDTest(); buildSD(); break;
-    case IR_PAGE: irEditing = false; irStart(); buildIR(); break;
+    case IR_PAGE: irStop(); buildIR(); break;   // starts on the IR submenu, receiver off
     case CLOCK_PAGE: buildClock(); break;
     case DATE_PAGE: buildDate(); break;
     case WEATHER_PAGE: wxState = 0; fetchWeather(); buildWeather(); break;
@@ -2177,6 +2758,10 @@ void loadSettings() {
   ledColorIdx     = prefs.getUChar("lc", 1);
   ledSpeedIdx     = prefs.getUChar("ls", 2);
   ledLevelIdx     = prefs.getUChar("ll", 2);
+  customProto     = prefs.getUChar("cp", 0);
+  customAddr      = prefs.getUChar("ca", 0);
+  customCmd       = prefs.getUChar("cc", 0);
+  customRepeats   = prefs.getUChar("cr", 0);
   prefs.end();
 
   if (configSelection < 0 || configSelection >= BRIGHT_COUNT) configSelection = 3;
@@ -2186,6 +2771,8 @@ void loadSettings() {
   if (ledColorIdx < 0 || ledColorIdx >= LED_COLOR_COUNT) ledColorIdx = 1;
   if (ledSpeedIdx < 0 || ledSpeedIdx > 4) ledSpeedIdx = 2;
   if (ledLevelIdx < 0 || ledLevelIdx > 4) ledLevelIdx = 2;
+  if (customProto < 0 || customProto >= CUSTOM_PROTO_COUNT) customProto = 0;
+  if (customRepeats < 0 || customRepeats > 3) customRepeats = 0;
   screenBrightness = brightLevels[configSelection];
 }
 
@@ -2199,6 +2786,10 @@ void saveSettings() {
   prefs.putUChar("lc", ledColorIdx);
   prefs.putUChar("ls", ledSpeedIdx);
   prefs.putUChar("ll", ledLevelIdx);
+  prefs.putUChar("cp", customProto);
+  prefs.putUChar("ca", customAddr);
+  prefs.putUChar("cc", customCmd);
+  prefs.putUChar("cr", customRepeats);
   prefs.end();
 }
 
@@ -2231,6 +2822,49 @@ void gpsClick() {
     else startTracker();
   }
   buildGPS();
+}
+
+// IR page click handling
+// subView 0 = menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
+void irClick() {
+  if (subView == 0) {
+    if (pageSel < 3) {
+      subParentSel = pageSel;
+      subView = pageSel + 1;
+      pageSel = 0;
+      scrollPos = 0.0f;
+      if (subView == 1) {
+        irMessage = irCaptured ? "Captured" : "Listening...";
+        irStart();                 // receiver only runs inside IR Capture
+      } else {
+        irStop();
+      }
+    }
+  } else if (subView == 1) {
+    // clear last capture and listen again
+    irCaptured = false;
+    irRawMode = false;
+    irProtocol = "None";
+    irAddress = 0;
+    irCommand = 0;
+    irMessage = "Listening...";
+    IrReceiver.resume();
+  } else if (subView == 2) {
+    replayIR();
+  } else if (subView == 3) {
+    switch (pageSel) {
+      case 0: customProto = (customProto + 1) % CUSTOM_PROTO_COUNT; break;
+      case 1: customAddr = (uint8_t)(customAddr + 0x10); break;
+      case 2: customAddr = (uint8_t)((customAddr & 0xF0) | ((customAddr + 1) & 0x0F)); break;
+      case 3: customCmd = (uint8_t)(customCmd + 0x10); break;
+      case 4: customCmd = (uint8_t)((customCmd & 0xF0) | ((customCmd + 1) & 0x0F)); break;
+      case 5: customRepeats = (customRepeats + 1) % 4; break;
+      case 6: sendCustomIR(); break;
+      default: break;
+    }
+    if (pageSel <= 5) saveSettings();
+  }
+  buildIR();
 }
 
 void configClick() {
@@ -2311,7 +2945,7 @@ void singleClick() {
       break;
 
     case GPS_PAGE: gpsClick(); break;
-    case LORA_PAGE: startLoRa(); buildLoRa(); break;
+    case LORA_PAGE: loraClick(); break;
     case SD_PAGE: runSDTest(); buildSD(); break;
     case IR_PAGE: irClick(); break;
     case CLOCK_PAGE:
@@ -2458,7 +3092,7 @@ void pollJoystick() {
   if (x < 2500) rightSwipeArmed = true;
   if (x > 1500) leftSwipeArmed = true;
 
-  if (page != MENU && rightSwipeArmed && rightHeld && now - lastRightSwipe > 350) {
+  if (page != MENU && !kbActive() && rightSwipeArmed && rightHeld && now - lastRightSwipe > 350) {
     rightSwipeArmed = false;
     lastRightSwipe = now;
     if (page == WIFI_PAGE && wifiDetailView) {
@@ -2466,13 +3100,14 @@ void pollJoystick() {
       pageSel = wifiSelectedIndex;
       scrollPos = (float)pageSel;
       buildWifiList();
+    } else if (page == LORA_PAGE && subView != 0) {
+      loraBack();
     } else if ((page == GPS_PAGE || page == CONFIG_PAGE || page == IR_PAGE) && subView != 0) {
       subView = 0;
       pageSel = subParentSel;
       scrollPos = (float)pageSel;
-      irEditing = false;
       if (page == GPS_PAGE) buildGPS();
-      else if (page == IR_PAGE) buildIR();
+      else if (page == IR_PAGE) { irStop(); buildIR(); }
       else buildConfig();
     } else if (page == BLE_PAGE && bleDetailView) {
       bleDetailView = false;
@@ -2485,14 +3120,33 @@ void pollJoystick() {
     return;
   }
 
-  if (page != FACE_PAGE && leftSwipeArmed && leftHeld && now - lastLeftSwipe > 350) {
+  if (page != FACE_PAGE && !kbActive() && leftSwipeArmed && leftHeld && now - lastLeftSwipe > 350) {
     leftSwipeArmed = false;
     lastLeftSwipe = now;
     openWatchFace();
     return;
   }
 
-  if (yHeld && now - lastNavigation > NAV_MS) {
+  // on-screen keyboard: stick moves the key cursor (repeats while held)
+  if (kbActive()) {
+    static int kbDirPrev = 0;
+    static unsigned long kbNext = 0;
+    int dx = leftHeld ? -1 : (rightHeld ? 1 : 0);
+    int dy = yHeld ? yd : 0;                 // -1 = up, +1 = down
+    int dir = dx != 0 ? dx : dy * 2;
+    if (dir == 0) {
+      kbDirPrev = 0;
+    } else if (dir != kbDirPrev) {
+      kbDirPrev = dir;
+      kbNext = now + 380;
+      kbMove(dx, dx != 0 ? 0 : dy);
+    } else if (now >= kbNext) {
+      kbNext = now + 140;
+      kbMove(dx, dx != 0 ? 0 : dy);
+    }
+  }
+
+  if (!kbActive() && yHeld && now - lastNavigation > NAV_MS) {
     int dir = yd;
     if (page == MENU) {
       int ns = selected + dir;
@@ -2501,10 +3155,6 @@ void pollJoystick() {
         lastNavigation = now;
         uiDirty = true;
       }
-    } else if (page == IR_PAGE && subView == 3 && irEditing) {
-      irEditNudge(dir);
-      lastNavigation = now;
-      buildIR();
     } else {
       int ns = pageSel + dir;
       if (ns >= 0 && ns < lineCount) {
@@ -2515,11 +3165,18 @@ void pollJoystick() {
     }
   }
 
+  static unsigned long btnDownAt = 0;
   bool down = swStable;
-  if (down && !buttonWasDown) buttonWasDown = true;
-  else if (!down && buttonWasDown) {
+  if (down && !buttonWasDown) {
+    buttonWasDown = true;
+    btnDownAt = now;
+  } else if (!down && buttonWasDown) {
     buttonWasDown = false;
-    singleClick();
+    if (now - btnDownAt >= 700 && loraLongClick()) {
+      lastDraw = millis();
+    } else {
+      singleClick();
+    }
   }
 }
 
@@ -2609,3 +3266,8 @@ void loop() {
     }
   }
 }
+
+
+/*git add -A
+git commit -m "Update project files and changes"
+git push*/

@@ -1,5 +1,3 @@
-
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -11,6 +9,7 @@
 #include <TinyGPSPlus.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#define RAW_BUFFER_LENGTH 750      // must be defined BEFORE IRremote.hpp: long remotes (AC units) no longer overflow
 #include <IRremote.hpp>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -53,7 +52,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define QR_AP_PASS   "watchout123"   // min 8 characters
 #define QR_MAX_TEXT  300
 
-#define FW_VERSION "v1.8"
+#define FW_VERSION "v1.9"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -373,17 +372,21 @@ String sdMessage = "Not tested";
 // ---------------- IR STATE ----------------
 // IR sub views: 0 = IR menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
 bool irCaptured = false;
-bool irRawMode = false;
+bool irRawMode = false;          // true = protocol unknown, so only a RAW replay is possible
+bool irSendRaw = true;           // IR Sender method: true = RAW replay (works for every remote), false = DECODED
 IRData storedIRData;
-uint8_t rawIRCode[RAW_BUFFER_LENGTH];
+uint16_t rawIRCode[RAW_BUFFER_LENGTH];   // mark/space timings in microseconds (first entry = mark)
 uint16_t rawIRLength = 0;
 String irProtocol = "None";
 String irMessage = "Listening...";
 uint16_t irAddress = 0;
 uint16_t irCommand = 0;
+uint16_t irBits = 0;
+uint32_t irData = 0;
 uint32_t irCaptures = 0;
 String irSendMessage = "Ready";
 uint32_t irSent = 0;
+int irRowMethod = -1;            // row index of "Method" in IR Sender (set while building)
 
 // Custom IR builder
 const char *CUSTOM_PROTO_NAMES[] = {"NEC", "Samsung", "Sony", "RC5", "RC6", "LG"};
@@ -3148,6 +3151,9 @@ void qrClick() {
 }
 
 // ======================= IR =======================
+// Capture stores BOTH the decoded values (protocol / address / command) and the raw
+// mark/space timings in microseconds. IR Sender replays the raw timings by default, which
+// works for every remote (even unknown protocols and long air-conditioner frames).
 
 // Only decode while inside IR Capture (subView 1)
 void pollIR() {
@@ -3155,47 +3161,80 @@ void pollIR() {
   auto &d = IrReceiver.decodedIRData;
   bool repeat = (d.flags & IRDATA_FLAGS_IS_REPEAT);
   bool overflow = (d.flags & IRDATA_FLAGS_WAS_OVERFLOW);
+  uint16_t rawlen = IrReceiver.irparams.rawlen;      // index 0 = gap before the frame, 1.. = mark,space,mark...
 
-  if (!repeat && !overflow && IrReceiver.irparams.rawlen > 3) {
+  if (overflow) {
+    irMessage = "Too long, retry";
+    lastDraw = 0;
+    uiDirty = true;
+  } else if (!repeat && rawlen >= 6) {
+    // 1) decoded details
     storedIRData = d;
     storedIRData.flags = 0;
-    irRawMode = (d.protocol == UNKNOWN || d.protocol == PULSE_WIDTH || d.protocol == PULSE_DISTANCE);
-    if (irRawMode) {
-      rawIRLength = IrReceiver.irparams.rawlen - 1;
-      if (rawIRLength > RAW_BUFFER_LENGTH) rawIRLength = RAW_BUFFER_LENGTH;
-      IrReceiver.compensateAndStoreIRResultInArray(rawIRCode);
-    }
-    irCaptured = true;
-    irCaptures++;
-    ledFlash(191, 90, 242, 300);
+    bool known = !(d.protocol == UNKNOWN || d.protocol == PULSE_WIDTH || d.protocol == PULSE_DISTANCE);
+    irRawMode = !known;
     irProtocol = String(getProtocolString(d.protocol));
     irAddress = d.address;
     irCommand = d.command;
-    irMessage = "Captured";
+    irBits = (uint16_t)d.numberOfBits;
+    irData = (uint32_t)d.decodedRawData;
+
+    // 2) raw timings in microseconds (compensated for the receiver's mark/space distortion)
+    uint16_t n = rawlen - 1;
+    if (n > RAW_BUFFER_LENGTH) n = RAW_BUFFER_LENGTH;
+    for (uint16_t i = 0; i < n; i++) {
+      uint32_t us = (uint32_t)IrReceiver.irparams.rawbuf[i + 1] * MICROS_PER_TICK;
+      if ((i & 1) == 0) {                            // mark
+        us = (us > MARK_EXCESS_MICROS) ? us - MARK_EXCESS_MICROS : us;
+      } else {                                       // space
+        us += MARK_EXCESS_MICROS;
+      }
+      rawIRCode[i] = (us > 65535UL) ? 65535 : (uint16_t)us;
+    }
+    rawIRLength = n;
+
+    irCaptured = true;
+    irCaptures++;
+    irSendRaw = true;                                // default replay method
+    ledFlash(191, 90, 242, 300);
+    irMessage = known ? "Captured" : "Captured (raw)";
     irSendMessage = "Ready";
     lastDraw = 0;
+    uiDirty = true;
   }
   IrReceiver.resume();
 }
 
+// make sure the IR LED pin / PWM carrier is (re)initialised right before every transmission
+void irTxPrepare() {
+  IrSender.begin(IR_TX_PIN);
+}
+
 // Send the last captured code (IR Sender)
 void replayIR() {
-  if (!irCaptured) {
+  if (!irCaptured || rawIRLength < 4) {
     irSendMessage = "Capture first";
     lastDraw = 0;
     return;
   }
   // receiver is stopped while in the Sender view, so just transmit
-  if (irRawMode) IrSender.sendRaw(rawIRCode, rawIRLength, 38);
-  else IrSender.write(&storedIRData);
+  irTxPrepare();
+  bool decoded = (!irSendRaw && !irRawMode);
+  if (decoded) {
+    IrSender.write(&storedIRData);
+    irSendMessage = "Sent decoded";
+  } else {
+    IrSender.sendRaw(rawIRCode, rawIRLength, 38);
+    irSendMessage = (!irSendRaw && irRawMode) ? "Sent raw (unknown)" : "Sent raw";
+  }
   irSent++;
-  irSendMessage = "Code sent";
   ledFlash(255, 255, 255, 200);
   lastDraw = 0;
 }
 
 // Send the code built in Custom IR
 void sendCustomIR() {
+  irTxPrepare();
   int rep = customRepeats;
   switch (customProto) {
     case 0: IrSender.sendNEC(customAddr, customCmd, rep); break;
@@ -3219,26 +3258,48 @@ String hex2(uint8_t v) {
   return "0x" + s;
 }
 
+String hexStr(uint32_t v) {
+  String s = String(v, HEX);
+  s.toUpperCase();
+  return "0x" + s;
+}
+
+void addIRDecodedDetails() {
+  if (irProtocol == "UNKNOWN") {
+    addLine("Hash", hexStr(irData), C_MUTED, C_WHITE);
+    addLine("Bits", String(irBits), C_MUTED, C_WHITE);
+    addWrapped("No protocol decode", C_YELLOW);
+  } else if (irProtocol == "PULSE_WIDTH" || irProtocol == "PULSE_DISTANCE") {
+    addLine("Data", hexStr(irData), C_MUTED, C_WHITE);
+    addLine("Bits", String(irBits), C_MUTED, C_WHITE);
+  } else {
+    addLine("Address", hexStr(irAddress), C_MUTED, C_WHITE);
+    addLine("Command", hexStr(irCommand), C_MUTED, C_WHITE);
+    addLine("Bits", String(irBits), C_MUTED, C_WHITE);
+    addLine("Data", hexStr(irData), C_MUTED, C_WHITE);
+  }
+}
+
 void buildIRCapture() {
   addLine("Status", irCaptured ? "CAPTURED" : "LISTENING", C_MUTED, irCaptured ? C_GREEN : C_YELLOW);
   addKV("Protocol", irProtocol, C_WHITE);
-  String a = String(irAddress, HEX); a.toUpperCase();
-  String c = String(irCommand, HEX); c.toUpperCase();
-  addLine("Address", "0x" + a, C_MUTED, C_WHITE);
-  addLine("Command", "0x" + c, C_MUTED, C_WHITE);
+  if (irCaptured) addIRDecodedDetails();
+  addLine("Pulses", String(rawIRLength), C_MUTED, C_WHITE);
   addLine("Captures", String(irCaptures), C_MUTED, C_WHITE);
   addWrapped(irMessage, C_CYAN);
 }
 
 void buildIRSender() {
+  irRowMethod = -1;
   addLine("Saved", irCaptured ? "YES" : "EMPTY", C_MUTED, irCaptured ? C_GREEN : C_RED);
   if (irCaptured) {
     addKV("Protocol", irProtocol, C_WHITE);
-    String a = String(irAddress, HEX); a.toUpperCase();
-    String c = String(irCommand, HEX); c.toUpperCase();
-    addLine("Address", "0x" + a, C_MUTED, C_WHITE);
-    addLine("Command", "0x" + c, C_MUTED, C_WHITE);
-    addLine("Mode", irRawMode ? "RAW" : "DECODED", C_MUTED, C_WHITE);
+    addIRDecodedDetails();
+    addLine("Pulses", String(rawIRLength), C_MUTED, C_WHITE);
+    irRowMethod = lineCount;
+    bool decoded = (!irSendRaw && !irRawMode);
+    addLine("Method", decoded ? "DECODED" : "RAW", C_WHITE, C_CYAN);
+    addLine("> SEND", "", C_GREEN, C_GREEN);
   } else {
     addWrapped("Use IR Capture", C_MUTED);
   }
@@ -3900,6 +3961,7 @@ void irClick() {
       if (subView == 1) {
         irMessage = irCaptured ? "Captured" : "Listening...";
         irStart();                 // receiver only runs inside IR Capture
+        IrReceiver.resume();
       } else {
         irStop();
       }
@@ -3911,10 +3973,24 @@ void irClick() {
     irProtocol = "None";
     irAddress = 0;
     irCommand = 0;
+    irBits = 0;
+    irData = 0;
+    rawIRLength = 0;
     irMessage = "Listening...";
     IrReceiver.resume();
   } else if (subView == 2) {
-    replayIR();
+    if (irCaptured && irRowMethod >= 0 && pageSel == irRowMethod) {
+      // toggle RAW <-> DECODED
+      if (irRawMode) {
+        irSendRaw = true;
+        irSendMessage = "Unknown: RAW only";
+      } else {
+        irSendRaw = !irSendRaw;
+        irSendMessage = "Ready";
+      }
+    } else {
+      replayIR();
+    }
   } else if (subView == 3) {
     switch (pageSel) {
       case 0: customProto = (customProto + 1) % CUSTOM_PROTO_COUNT; break;
@@ -4296,6 +4372,8 @@ void setup() {
 }
 
 void loop() {
+  pollIR();
+
   while (GPSSerial.available()) gps.encode((char)GPSSerial.read());
 
   syncTimeFromGPS();
@@ -4307,7 +4385,6 @@ void loop() {
   pollAP();
   pollRadar();
   pollLoRa();
-  pollIR();
   trackerPoll();
   qrPoll();
   dimUpdate();

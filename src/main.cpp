@@ -89,8 +89,7 @@ RF24 nrf24(NRF24_CE, NRF24_CSN);
 bool nrf24Ready = false;
 bool nrf24Scanned = false;
 uint8_t nrf24Activity[84] = {};
-uint8_t nrf24PeakChannel = 0;
-uint8_t nrf24PeakActivity = 0;
+unsigned long nrf24LastScan = 0;
 
 GFXcanvas16 *canvas = nullptr;
 bool canvasReady = false;
@@ -175,6 +174,7 @@ void saveSettings();
 void startLoRa();
 void startNRF24();
 void scanNRF24Spectrum();
+void pollNRF24Spectrum();
 void buildNRF24();
 void renderNRFSpectrum();
 void buildWifi();
@@ -2153,8 +2153,6 @@ void startNRF24() {
 
 void scanNRF24Spectrum() {
   nrf24Scanned = false;
-  nrf24PeakActivity = 0;
-  nrf24PeakChannel = 0;
   if (!nrf24Ready || !nrf24.isChipConnected()) {
     nrf24Ready = false;
     return;
@@ -2172,10 +2170,6 @@ void scanNRF24Spectrum() {
     }
     nrf24.stopListening();
     nrf24Activity[channel] = (uint8_t)(busySamples * 100 / sampleCount);
-    if (nrf24Activity[channel] > nrf24PeakActivity) {
-      nrf24PeakActivity = nrf24Activity[channel];
-      nrf24PeakChannel = channel;
-    }
   }
 
   nrf24.setChannel(76);
@@ -2183,6 +2177,14 @@ void scanNRF24Spectrum() {
   nrf24Scanned = true;
   lastDraw = 0;
   uiDirty = true;
+}
+
+void pollNRF24Spectrum() {
+  if (page != NRF24_PAGE || subView != 2 || !nrf24Ready) return;
+  unsigned long now = millis();
+  if (now - nrf24LastScan < 250) return;
+  nrf24LastScan = now;
+  scanNRF24Spectrum();
 }
 
 void buildNRF24Info() {
@@ -2214,7 +2216,7 @@ void buildNRF24() {
     default:
       addLine("Information", nrf24Ready ? "READY" : "NO RADIO",
               C_WHITE, nrf24Ready ? C_GREEN : C_RED);
-      addLine("Spectrum", nrf24Ready ? "SCAN" : "NO RADIO",
+      addLine("Spectrum", nrf24Ready ? "LIVE" : "NO RADIO",
               C_WHITE, nrf24Ready ? C_CYAN : C_MUTED);
       break;
   }
@@ -2237,7 +2239,7 @@ void renderNRFSpectrum() {
     const int graphLeft = 24;
     const int graphRight = 232;
     const int graphTop = 55;
-    const int graphBottom = 224;
+    const int graphBottom = 242;
     const int graphHeight = graphBottom - graphTop;
 
     for (int level = 0; level <= 100; level += 25) {
@@ -2262,20 +2264,10 @@ void renderNRFSpectrum() {
 
     g->setTextSize(1);
     g->setTextColor(themeColor(C_WHITE));
-    g->setCursor(graphLeft, 230);
+    g->setCursor(graphLeft, 248);
     g->print("2400 MHz");
-    g->setCursor(graphRight - 48, 230);
+    g->setCursor(graphRight - 48, 248);
     g->print("2483 MHz");
-
-    g->setCursor(8, 252);
-    if (nrf24PeakActivity == 0) {
-      g->setTextColor(themeColor(C_GREEN));
-      g->print("No activity detected  -  click to rescan");
-    } else {
-      g->setTextColor(themeColor(C_YELLOW));
-      g->printf("Peak CH %u  %u%%  -  click to rescan",
-                nrf24PeakChannel, nrf24PeakActivity);
-    }
   }
 
   if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
@@ -3955,11 +3947,8 @@ void nrf24Click() {
     subView = pageSel + 1;
     pageSel = 0;
     scrollPos = 0.0f;
-    if (subView == 2) scanNRF24Spectrum();
   } else if (subView == 1) {
     nrf24Ready = nrf24.isChipConnected();
-  } else if (subView == 2) {
-    scanNRF24Spectrum();
   }
   buildNRF24();
 }
@@ -4346,6 +4335,7 @@ void loop() {
   pollAP();
   pollRadar();
   pollLoRa();
+  pollNRF24Spectrum();
   trackerPoll();
   qrPoll();
   dimUpdate();

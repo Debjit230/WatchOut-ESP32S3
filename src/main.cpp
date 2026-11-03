@@ -4,8 +4,8 @@
 #include "esp_wifi.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
-#include <SD.h>
 #include <LoRa.h>
+#include <RF24.h>
 #include <TinyGPSPlus.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -41,11 +41,9 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define TRACKER_ID         "watchout01"
 #define TRACKER_INTERVAL_S 15
 
-// Offline tracker options
-#define TRACKER_USE_WIFI    1      // 1 = upload/live-view when Wi-Fi is available, 0 = pure offline SD logger
+// Tracker options
 #define TRACKER_LORA_BEACON 0      // 1 = also broadcast position over LoRa (433 MHz) so another LoRa node can follow you
 #define TRACKER_BEACON_S    30
-#define TRACKER_FILE        "/track.csv"
 
 // Custom QR options
 #define QR_AP_SSID   "WatchOut-QR"   // hotspot used when no Wi-Fi is available
@@ -76,7 +74,9 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define LORA_DIO0 8
 #define LORA_FREQ 433E6
 
-#define SD_CS     19
+#define NRF24_CE  21
+#define NRF24_CSN 47
+
 #define IR_RX_PIN 4
 #define IR_TX_PIN 5
 
@@ -85,6 +85,12 @@ Adafruit_ST7789 lcd(&SPI, LCD_CS, LCD_DC, LCD_RST);
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
 BLEScan *bleScan = nullptr;
+RF24 nrf24(NRF24_CE, NRF24_CSN);
+bool nrf24Ready = false;
+bool nrf24Scanned = false;
+uint8_t nrf24Activity[84] = {};
+uint8_t nrf24PeakChannel = 0;
+uint8_t nrf24PeakActivity = 0;
 
 GFXcanvas16 *canvas = nullptr;
 bool canvasReady = false;
@@ -151,7 +157,7 @@ enum Page : uint8_t {
   BLE_PAGE,
   GPS_PAGE,
   LORA_PAGE,
-  SD_PAGE,
+  NRF24_PAGE,
   IR_PAGE,
   CLOCK_PAGE,
   DATE_PAGE,
@@ -167,6 +173,10 @@ void enterPage(Page p);
 void goBackToMenu();
 void saveSettings();
 void startLoRa();
+void startNRF24();
+void scanNRF24Spectrum();
+void buildNRF24();
+void renderNRFSpectrum();
 void buildWifi();
 void kbPress();
 void kbOpen();
@@ -176,8 +186,8 @@ void qrBack();
 void qrNetStop();
 
 const char *menuItems[] = {
-  "Wi-Fi", "Bluetooth", "GPS", "LoRa", "SD Card",
-  "IR Remote", "Clock", "Date", "Weather", "QR Code", "Settings"
+  "Wi-Fi", "Bluetooth", "GPS", "LoRa", "NRF24", "IR Remote",
+  "Clock", "Date", "Weather", "QR Code", "Settings"
 };
 const int MENU_COUNT = 11;
 int selected = 0;
@@ -363,11 +373,6 @@ unsigned long chatStatusAt = 0;
 int kbMode = 0;      // 0 abc, 1 ABC (one shot), 2 123/symbols
 int kbRow = 0;
 int kbCol = 0;
-
-bool sdOK = false;
-bool sdTried = false;
-bool sdTestOK = false;
-String sdMessage = "Not tested";
 
 // ---------------- IR STATE ----------------
 // IR sub views: 0 = IR menu, 1 = IR Capture, 2 = IR Sender, 3 = Custom IR
@@ -584,9 +589,11 @@ void drawGlyph(Adafruit_GFX *g, int i, int cx, int cy, float k, uint8_t br, uint
       break;
     }
     case 4: {
-      g->fillRect(cx - S(8), cy - S(11), S(16), S(22), w);
-      g->fillTriangle(cx + S(2), cy - S(11), cx + S(8) + 1, cy - S(11), cx + S(8) + 1, cy - S(5), accent);
-      for (int s = 0; s < 3; s++) g->fillRect(cx - S(5) + s * S(3.5f), cy - S(8), max(1, S(2)), S(6), accent);
+      g->fillRoundRect(cx - S(10), cy - S(7), S(20), S(14), 3, w);
+      g->drawLine(cx - S(5), cy - S(10), cx - S(5), cy - S(7), w);
+      g->drawLine(cx + S(5), cy - S(10), cx + S(5), cy - S(7), w);
+      g->fillCircle(cx - S(5), cy, max(1, S(2)), accent);
+      g->fillCircle(cx + S(5), cy, max(1, S(2)), accent);
       break;
     }
     case 5: {
@@ -1270,6 +1277,7 @@ void renderUI() {
   else if (kbActive()) renderKeyboard();
   else if (radarActive()) renderRadar();
   else if (qrActive()) renderQR();
+  else if (page == NRF24_PAGE && subView == 2) renderNRFSpectrum();
   else renderPage();
 }
 
@@ -1915,64 +1923,9 @@ i.innerHTML=d.lat.toFixed(5)+', '+d.lon.toFixed(5)+' &middot; '+d.spd+' km/h &mi
 tick();setInterval(tick,3000);
 </script></body></html>)HTML";
 
-// ---------------- OFFLINE TRACKER ----------------
-// Every fix is appended to /track.csv on the SD card:  epoch,lat,lon,speed_knots,bearing,alt,hdop
-// If Wi-Fi is up, points not yet uploaded are sent to the Traccar server (with their real timestamps).
-bool trkSdReady = false;
-uint32_t trkOff = 0;              // byte offset in the log of the next point to upload
-uint32_t trkLogSize = 0;
-uint32_t trkLogged = 0;           // points logged this session
-uint32_t trkPending = 0;          // points logged but not uploaded yet
-uint32_t trkPendingOff = 0;
-uint8_t trkAckSinceSave = 0;
-volatile bool trkAwaiting = false;
-unsigned long lastTrkLog = 0;
-unsigned long trkRetryAt = 0;
-unsigned long lastTrkSdTry = 0;
+// ---------------- LIVE GPS TRACKER ----------------
 unsigned long lastTrkBeacon = 0;
 uint32_t trkBeacons = 0;
-
-void trkSaveOff() {
-  Preferences tp;
-  tp.begin("watchout", false);
-  tp.putUInt("tkoff", trkOff);
-  tp.end();
-  trkAckSinceSave = 0;
-}
-
-bool trackerSdMount() {
-  if (sdOK) return true;
-  digitalWrite(LORA_CS, HIGH);
-  digitalWrite(LCD_CS, HIGH);
-  sdOK = SD.begin(SD_CS, SPI, 4000000);
-  sdTried = true;
-  return sdOK;
-}
-
-void trackerPrepareLog() {
-  trkSdReady = trackerSdMount();
-  trkPending = 0;
-  if (!trkSdReady) return;
-
-  Preferences tp;
-  tp.begin("watchout", true);
-  trkOff = tp.getUInt("tkoff", 0);
-  tp.end();
-
-  File f = SD.open(TRACKER_FILE, FILE_READ);
-  if (!f) { trkLogSize = 0; trkOff = 0; return; }
-  trkLogSize = f.size();
-  if (trkOff > trkLogSize) trkOff = 0;      // card was replaced / file cleared
-  f.seek(trkOff);
-  uint8_t buf[512];
-  while (f.available()) {
-    int n = f.read(buf, sizeof(buf));
-    if (n <= 0) break;
-    for (int i = 0; i < n; i++) if (buf[i] == '\n') trkPending++;
-    pumpGPS();
-  }
-  f.close();
-}
 
 bool trackerEpoch(uint32_t &ep) {
   if (!(gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024)) return false;
@@ -1982,27 +1935,6 @@ bool trackerEpoch(uint32_t &ep) {
   return true;
 }
 
-void trackerLogPoint() {
-  if (!trkSdReady) return;
-  uint32_t ep;
-  if (!trackerEpoch(ep)) return;
-  char buf[128];
-  snprintf(buf, sizeof(buf), "%lu,%.6f,%.6f,%.1f,%.0f,%.1f,%.1f\n",
-           (unsigned long)ep, gps.location.lat(), gps.location.lng(),
-           gps.speed.isValid() ? gps.speed.knots() : 0.0,
-           gps.course.isValid() ? gps.course.deg() : 0.0,
-           gps.altitude.isValid() ? gps.altitude.meters() : 0.0,
-           gps.hdop.isValid() ? gps.hdop.hdop() : 0.0);
-  File f = SD.open(TRACKER_FILE, FILE_APPEND);
-  if (!f) { trkSdReady = false; sdOK = false; return; }   // card lost, retry mount later
-  f.print(buf);
-  trkLogSize = f.size();
-  f.close();
-  trkLogged++;
-  trkPending++;
-}
-
-#if TRACKER_USE_WIFI
 void trackerHandleRoot() { webServer.send_P(200, "text/html", TRACK_HTML); }
 
 void trackerHandleLoc() {
@@ -2021,39 +1953,19 @@ void trackerHandleLoc() {
   webServer.send(200, "application/json", j);
 }
 
-// Download the whole SD log:  http://watchout.local/log.csv
-void trackerHandleLog() {
-  if (!trkSdReady) { webServer.send(404, "text/plain", "No SD log"); return; }
-  File f = SD.open(TRACKER_FILE, FILE_READ);
-  if (!f) { webServer.send(404, "text/plain", "No log file yet"); return; }
-  webServer.sendHeader("Content-Disposition", "attachment; filename=track.csv");
-  webServer.streamFile(f, "text/csv");
-  f.close();
-}
-#endif
-
 void startTracker() {
   trackerOn = true;
   trkServerUp = false;
   trkLastCode = 0;
   lastTrkSend = 0;
-  lastTrkLog = 0;
   lastTrkBeacon = 0;
-  trkAwaiting = false;
-  trkRetryAt = 0;
-  trkLogged = 0;
-  trkAckSinceSave = 0;
-  trackerPrepareLog();
-#if TRACKER_USE_WIFI
   if (!trkHandlers) {
     webServer.on("/", trackerHandleRoot);
     webServer.on("/loc", trackerHandleLoc);
-    webServer.on("/log.csv", trackerHandleLog);
     trkHandlers = true;
   }
   wifiBegin();
   lastTrkWifiTry = millis();
-#endif
 #if TRACKER_LORA_BEACON
   if (!loraOK) startLoRa();
 #endif
@@ -2061,12 +1973,9 @@ void startTracker() {
 
 void stopTracker() {
   trackerOn = false;
-  if (trkSdReady) trkSaveOff();
   if (trkServerUp) { webServer.stop(); trkServerUp = false; }
   if (trkMdns) { MDNS.end(); trkMdns = false; }
-#if TRACKER_USE_WIFI
   if (!apHold) WiFi.disconnect(false, false);
-#endif
 }
 
 static void trackerUploadTask(void *arg) {
@@ -2112,7 +2021,6 @@ bool trackerFire(const String &u) {
   return true;
 }
 
-// Fallback when there is no SD card: send the live position only (old behaviour)
 void trackerSend() {
   if (trkSending) return;
   lastTrkSend = millis();
@@ -2125,35 +2033,6 @@ void trackerSend() {
     "&altitude=" + String(gps.altitude.isValid() ? gps.altitude.meters() : 0.0, 1) +
     "&hdop=" + String(gps.hdop.isValid() ? gps.hdop.hdop() : 0.0, 1)
   );
-}
-
-// Upload the next un-sent point from the SD log (with its original timestamp)
-void trackerSendNext() {
-  File f = SD.open(TRACKER_FILE, FILE_READ);
-  if (!f) { trkSdReady = false; sdOK = false; return; }
-  if (trkOff >= f.size()) { trkPending = 0; f.close(); return; }
-  f.seek(trkOff);
-  String line = f.readStringUntil('\n');
-  uint32_t next = f.position();
-  f.close();
-  line.trim();
-
-  unsigned long ep = 0;
-  double lat = 0, lon = 0;
-  float spd = 0, brg = 0, alt = 0, hd = 0;
-  int n = sscanf(line.c_str(), "%lu,%lf,%lf,%f,%f,%f,%f", &ep, &lat, &lon, &spd, &brg, &alt, &hd);
-  if (n != 7) {                       // damaged line: skip it
-    trkOff = next;
-    if (trkPending > 0) trkPending--;
-    return;
-  }
-  trkPendingOff = next;
-  String url = String(TRACKER_SERVER) + "/?id=" + TRACKER_ID +
-               "&timestamp=" + String(ep) +
-               "&lat=" + String(lat, 6) + "&lon=" + String(lon, 6) +
-               "&speed=" + String(spd, 1) + "&bearing=" + String(brg, 0) +
-               "&altitude=" + String(alt, 1) + "&hdop=" + String(hd, 1);
-  if (trackerFire(url)) trkAwaiting = true;
 }
 
 void trackerBeacon() {
@@ -2177,18 +2056,6 @@ void trackerPoll() {
   unsigned long now = millis();
   bool fix = gps.location.isValid() && gps.location.age() < 5000;
 
-  // 1) always log to SD, with or without Wi-Fi
-  if (fix && now - lastTrkLog >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
-    lastTrkLog = now;
-    trackerLogPoint();
-  }
-
-  // 2) retry SD mount if the card was missing / lost
-  if (!trkSdReady && now - lastTrkSdTry > 30000) {
-    lastTrkSdTry = now;
-    trackerPrepareLog();
-  }
-
 #if TRACKER_LORA_BEACON
   if (fix && now - lastTrkBeacon >= (unsigned long)TRACKER_BEACON_S * 1000UL) {
     lastTrkBeacon = now;
@@ -2196,8 +2063,6 @@ void trackerPoll() {
   }
 #endif
 
-#if TRACKER_USE_WIFI
-  // 3) Wi-Fi is optional: only used to upload the backlog and serve the live map
   if (WiFi.status() != WL_CONNECTED) {
     if (now - lastTrkWifiTry > 15000 && apState != 1 && apState != 5) {
       lastTrkWifiTry = now;
@@ -2215,25 +2080,10 @@ void trackerPoll() {
   }
   webServer.handleClient();
 
-  if (trkAwaiting && !trkSending) {
-    if (trkLastCode == 200) {
-      trkOff = trkPendingOff;
-      if (trkPending > 0) trkPending--;
-      if (++trkAckSinceSave >= 10) trkSaveOff();
-    } else {
-      trkRetryAt = now + 5000;        // server unreachable: wait and try again
-    }
-    trkAwaiting = false;
+  if (!trkSending && fix && strlen(TRACKER_SERVER) > 0 &&
+      now - lastTrkSend >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
+    trackerSend();
   }
-
-  if (!trkSending && !trkAwaiting && strlen(TRACKER_SERVER) > 0) {
-    if (trkSdReady) {
-      if (trkPending > 0 && now >= trkRetryAt) trackerSendNext();
-    } else if (fix && now - lastTrkSend >= (unsigned long)TRACKER_INTERVAL_S * 1000UL) {
-      trackerSend();                  // no SD card: live upload only
-    }
-  }
-#endif
 }
 
 void buildGPSTracker() {
@@ -2242,35 +2092,23 @@ void buildGPSTracker() {
   bool fix = gps.location.isValid() && gps.location.age() < 5000;
   addLine("Tracker", trackerOn ? "ON" : "OFF", C_WHITE, trackerOn ? C_GREEN : C_RED);
   if (trackerOn) {
-#if TRACKER_USE_WIFI
     addLine("Wi-Fi", wifi ? "ONLINE" : "OFFLINE", C_MUTED, wifi ? C_GREEN : C_YELLOW);
     if (wifi) {
       addKV("Open", WiFi.localIP().toString(), C_CYAN);
       addKV("Or", "watchout.local", C_CYAN);
     }
-#else
-    addLine("Mode", "OFFLINE", C_MUTED, C_YELLOW);
-#endif
-    addLine("SD Log", trkSdReady ? "LOGGING" : "NO SD", C_MUTED, trkSdReady ? C_GREEN : C_RED);
   }
   addLine("Fix", fix ? "VALID" : "NO FIX", C_MUTED, fix ? C_GREEN : C_YELLOW);
   addLine("Sats", String(gps.satellites.isValid() ? gps.satellites.value() : 0), C_MUTED, C_WHITE);
-  if (trackerOn && trkSdReady) {
-    addLine("Logged", String((unsigned long)trkLogged), C_MUTED, C_WHITE);
-    addLine("Pending", String((unsigned long)trkPending), C_MUTED, trkPending ? C_YELLOW : C_GREEN);
-    addLine("Log size", String((unsigned long)(trkLogSize / 1024)) + " KB", C_MUTED, C_WHITE);
-  }
 #if TRACKER_LORA_BEACON
   addLine("Beacons", String((unsigned long)trkBeacons), C_MUTED, C_WHITE);
 #endif
-#if TRACKER_USE_WIFI
   if (strlen(TRACKER_SERVER) > 0) {
     int code = trkLastCode;
     addLine("Uploaded", String((unsigned long)trkSent), C_MUTED, C_WHITE);
     addLine("Server", code == 0 ? String("--") : (code == 200 ? String("OK") : String(code)),
             C_MUTED, code == 200 ? C_GREEN : (code == 0 ? C_MUTED : C_RED));
   }
-#endif
   finishLines();
 }
 
@@ -2285,42 +2123,7 @@ void buildGPS() {
   }
 }
 
-void runSDTest() {
-  digitalWrite(LORA_CS, HIGH);
-  digitalWrite(LCD_CS, HIGH);
-  sdOK = SD.begin(SD_CS, SPI, 4000000);
-  sdTried = true;
-  sdTestOK = false;
-  if (!sdOK) { sdMessage = "Mount failed: check SPI/CS"; return; }
-  File f = SD.open("/module_test.txt", FILE_WRITE);
-  if (!f) { sdMessage = "File write failed"; return; }
-  f.println("ESP32-S3 SD test passed");
-  f.close();
-  f = SD.open("/module_test.txt", FILE_READ);
-  if (!f) { sdMessage = "File read failed"; return; }
-  String data = f.readStringUntil('\n');
-  f.close();
-  sdTestOK = data.indexOf("test passed") >= 0;
-  sdMessage = sdTestOK ? "Read/write PASS" : "Data mismatch";
-}
-
-void buildSD() {
-  startLines();
-  addLine("Card", sdOK ? "OK" : "FAILED", C_MUTED, sdOK ? C_GREEN : C_RED);
-  addLine("Test", "", C_MUTED, C_MUTED);
-  addWrapped(sdMessage, sdTestOK ? C_GREEN : C_YELLOW);
-  if (sdOK) {
-    uint64_t mb = SD.cardSize() / (1024ULL * 1024ULL);
-    addLine("Size", String((unsigned long)mb) + " MB", C_MUTED, C_WHITE);
-  } else {
-    addWrapped("Check wiring", C_MUTED);
-    addWrapped("FAT32, 3.3V", C_MUTED);
-  }
-  finishLines();
-}
-
 void startLoRa() {
-  digitalWrite(SD_CS, HIGH);
   digitalWrite(LCD_CS, HIGH);
   LoRa.setSPI(SPI);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
@@ -2332,6 +2135,150 @@ void startLoRa() {
   } else {
     Serial.println("LoRa init failed: check wiring and 3.3V supply");
   }
+}
+
+void startNRF24() {
+  digitalWrite(LCD_CS, HIGH);
+  digitalWrite(LORA_CS, HIGH);
+  nrf24Ready = nrf24.begin() && nrf24.isChipConnected();
+  nrf24Scanned = false;
+  if (!nrf24Ready) return;
+
+  nrf24.setAutoAck(false);
+  nrf24.setDataRate(RF24_1MBPS);
+  nrf24.setPALevel(RF24_PA_MIN);
+  nrf24.setChannel(76);
+  nrf24.stopListening();
+}
+
+void scanNRF24Spectrum() {
+  nrf24Scanned = false;
+  nrf24PeakActivity = 0;
+  nrf24PeakChannel = 0;
+  if (!nrf24Ready || !nrf24.isChipConnected()) {
+    nrf24Ready = false;
+    return;
+  }
+
+  const uint8_t sampleCount = 4;
+  for (uint8_t channel = 0; channel < 84; channel++) {
+    uint8_t busySamples = 0;
+    for (uint8_t sample = 0; sample < sampleCount; sample++) {
+      nrf24.stopListening();
+      nrf24.setChannel(channel);
+      nrf24.startListening();
+      delayMicroseconds(140);
+      if (nrf24.testRPD()) busySamples++;
+    }
+    nrf24.stopListening();
+    nrf24Activity[channel] = (uint8_t)(busySamples * 100 / sampleCount);
+    if (nrf24Activity[channel] > nrf24PeakActivity) {
+      nrf24PeakActivity = nrf24Activity[channel];
+      nrf24PeakChannel = channel;
+    }
+  }
+
+  nrf24.setChannel(76);
+  nrf24.startListening();
+  nrf24Scanned = true;
+  lastDraw = 0;
+  uiDirty = true;
+}
+
+void buildNRF24Info() {
+  addLine("Radio", nrf24Ready ? "CONNECTED" : "NOT FOUND",
+          C_MUTED, nrf24Ready ? C_GREEN : C_RED);
+  if (!nrf24Ready) {
+    addWrapped("Check 3.3V, GND, SPI, CE/CSN", C_YELLOW);
+    return;
+  }
+
+  addLine("Chip", "nRF24L01+", C_MUTED, C_WHITE);
+  addLine("CE / CSN", String(NRF24_CE) + " / " + String(NRF24_CSN), C_MUTED, C_WHITE);
+  addLine("SPI", "SCK13 MISO12 MOSI11", C_MUTED, C_WHITE);
+  addLine("Channel", String(nrf24.getChannel()), C_MUTED, C_WHITE);
+  addLine("Frequency", String(2400 + nrf24.getChannel()) + " MHz", C_MUTED, C_WHITE);
+  addLine("Data rate", "1 Mbps", C_MUTED, C_WHITE);
+  addLine("Power", "MIN", C_MUTED, C_WHITE);
+  addLine("ISM range", "2400-2483 MHz", C_MUTED, C_WHITE);
+}
+
+void buildNRF24() {
+  startLines();
+  switch (subView) {
+    case 1:
+      buildNRF24Info();
+      break;
+    case 2:
+      break;
+    default:
+      addLine("Information", nrf24Ready ? "READY" : "NO RADIO",
+              C_WHITE, nrf24Ready ? C_GREEN : C_RED);
+      addLine("Spectrum", nrf24Ready ? "SCAN" : "NO RADIO",
+              C_WHITE, nrf24Ready ? C_CYAN : C_MUTED);
+      break;
+  }
+  finishLines();
+}
+
+void renderNRFSpectrum() {
+  Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
+  g->fillScreen(bgColor());
+  boldText(g, 10, 8, "NRF24 SPECTRUM", themeColor(C_CYAN), 2, 1);
+
+  if (!nrf24Ready) {
+    boldText(g, 10, 90, "RADIO NOT FOUND", themeColor(C_RED), 2, 1);
+    boldText(g, 10, 116, "Check wiring and 3.3V", themeColor(C_MUTED), 1, 1);
+  } else if (!nrf24Scanned) {
+    boldText(g, 10, 90, "No scan yet", themeColor(C_YELLOW), 2, 1);
+  } else {
+    boldText(g, 10, 29, "Channel activity above -64 dBm", themeColor(C_WHITE), 1, 1);
+
+    const int graphLeft = 24;
+    const int graphRight = 232;
+    const int graphTop = 55;
+    const int graphBottom = 224;
+    const int graphHeight = graphBottom - graphTop;
+
+    for (int level = 0; level <= 100; level += 25) {
+      int y = graphBottom - (graphHeight * level / 100);
+      g->drawFastHLine(graphLeft, y, graphRight - graphLeft, themeColor(C_MUTED));
+      g->setTextSize(1);
+      g->setTextColor(themeColor(C_WHITE));
+      g->setCursor(2, y - 3);
+      g->print(level);
+    }
+
+    for (uint8_t channel = 0; channel < 84; channel++) {
+      int x0 = graphLeft + (graphRight - graphLeft) * channel / 84;
+      int x1 = graphLeft + (graphRight - graphLeft) * (channel + 1) / 84;
+      int barHeight = graphHeight * nrf24Activity[channel] / 100;
+      if (barHeight == 0) continue;
+      uint16_t color = nrf24Activity[channel] >= 75 ? C_RED :
+                       (nrf24Activity[channel] >= 25 ? C_YELLOW : C_GREEN);
+      g->fillRect(x0, graphBottom - barHeight, max(1, x1 - x0), barHeight,
+                  themeColor(color));
+    }
+
+    g->setTextSize(1);
+    g->setTextColor(themeColor(C_WHITE));
+    g->setCursor(graphLeft, 230);
+    g->print("2400 MHz");
+    g->setCursor(graphRight - 48, 230);
+    g->print("2483 MHz");
+
+    g->setCursor(8, 252);
+    if (nrf24PeakActivity == 0) {
+      g->setTextColor(themeColor(C_GREEN));
+      g->print("No activity detected  -  click to rescan");
+    } else {
+      g->setTextColor(themeColor(C_YELLOW));
+      g->printf("Peak CH %u  %u%%  -  click to rescan",
+                nrf24PeakChannel, nrf24PeakActivity);
+    }
+  }
+
+  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
 }
 
 void buildLoRa();
@@ -3352,7 +3299,6 @@ void buildSystem() {
   addLine("GPS Fix", fix ? "VALID" : "NO FIX", C_MUTED, fix ? C_GREEN : C_YELLOW);
   addLine("Sats", String(gps.satellites.isValid() ? gps.satellites.value() : 0), C_MUTED, C_WHITE);
   addLine("LoRa", loraTried ? (loraOK ? "READY" : "FAILED") : "IDLE", C_MUTED, loraTried ? (loraOK ? C_GREEN : C_RED) : C_WHITE);
-  addLine("SD Card", sdTried ? (sdOK ? "OK" : "FAILED") : "IDLE", C_MUTED, sdTried ? (sdOK ? C_GREEN : C_RED) : C_WHITE);
   addLine("IR", "READY", C_MUTED, C_GREEN);
   addLine("Display", canvasReady ? "BUFFERED" : "DIRECT", C_MUTED, canvasReady ? C_GREEN : C_YELLOW);
   addLine("Time", timeSynced ? timeSource : String("NONE"), C_MUTED, timeSynced ? C_GREEN : C_YELLOW);
@@ -3374,7 +3320,6 @@ void buildAbout() {
   addKV("Display", "ST7789 240x280", C_WHITE);
   addKV("GPS", "NEO6M " + String(GPS_BAUD) + " baud", C_WHITE);
   addKV("LoRa", "SX1278 " + String((int)(LORA_FREQ / 1E6)) + " MHz", C_WHITE);
-  addKV("SD", "SPI, CS " + String(SD_CS), C_WHITE);
   addKV("IR", "RX " + String(IR_RX_PIN) + " TX " + String(IR_TX_PIN), C_WHITE);
   addKV("RGB LED", "WS2812 GPIO" + String(RGB_LED_PIN), C_WHITE);
 }
@@ -3769,10 +3714,7 @@ void ledAuto() {
       if (loraOK) { r = 0; g = 255; b = 0; period = 3000; }
       else { r = 255; g = 0; b = 0; style = 1; period = 600; }
       break;
-    case SD_PAGE:
-      if (sdTestOK) { r = 0; g = 255; b = 0; style = 0; }
-      else { r = 255; g = 0; b = 0; style = 1; period = 600; }
-      break;
+    case NRF24_PAGE: c565to888(appColor(4), r, g, b); style = (subView == 2 && nrf24Ready) ? 2 : 0; period = 1500; break;
     case IR_PAGE: c565to888(appColor(5), r, g, b); style = (subView == 1 && !irCaptured) ? 2 : 0; period = 1500; break;
     case CLOCK_PAGE: c565to888(appColor(6), r, g, b); period = 4000; break;
     case DATE_PAGE: c565to888(appColor(7), r, g, b); style = 0; break;
@@ -3855,7 +3797,7 @@ void enterPage(Page p) {
       break;
     case GPS_PAGE: buildGPS(); break;
     case LORA_PAGE: startLoRa(); buildLoRa(); break;
-    case SD_PAGE: runSDTest(); buildSD(); break;
+    case NRF24_PAGE: startNRF24(); buildNRF24(); break;
     case IR_PAGE: irStop(); buildIR(); break;   // starts on the IR submenu, receiver off
     case CLOCK_PAGE: buildClock(); break;
     case DATE_PAGE: buildDate(); break;
@@ -4007,6 +3949,21 @@ void irClick() {
   buildIR();
 }
 
+void nrf24Click() {
+  if (subView == 0) {
+    subParentSel = pageSel;
+    subView = pageSel + 1;
+    pageSel = 0;
+    scrollPos = 0.0f;
+    if (subView == 2) scanNRF24Spectrum();
+  } else if (subView == 1) {
+    nrf24Ready = nrf24.isChipConnected();
+  } else if (subView == 2) {
+    scanNRF24Spectrum();
+  }
+  buildNRF24();
+}
+
 void configClick() {
   if (subView == 0) {
     if (pageSel < 4) {
@@ -4074,7 +4031,7 @@ void singleClick() {
 
     case GPS_PAGE: gpsClick(); break;
     case LORA_PAGE: loraClick(); break;
-    case SD_PAGE: runSDTest(); buildSD(); break;
+    case NRF24_PAGE: nrf24Click(); break;
     case IR_PAGE: irClick(); break;
     case CLOCK_PAGE:
     case DATE_PAGE: break;
@@ -4096,6 +4053,7 @@ void leavePageCleanup() {
     apStage = 0;
   }
   if (page == BLE_PAGE) bleDetailView = false;
+  if (page == NRF24_PAGE && nrf24Ready) nrf24.stopListening();
   if (page == IR_PAGE) irStop();
   if (page == QR_PAGE) {
     qrShowing = false;
@@ -4237,6 +4195,11 @@ void pollJoystick() {
       loraBack();
     } else if (page == QR_PAGE && (subView != 0 || qrShowing)) {
       qrBack();
+    } else if (page == NRF24_PAGE && subView != 0) {
+      subView = 0;
+      pageSel = subParentSel;
+      scrollPos = (float)pageSel;
+      buildNRF24();
     } else if ((page == GPS_PAGE || page == CONFIG_PAGE || page == IR_PAGE) && subView != 0) {
       subView = 0;
       pageSel = subParentSel;
@@ -4335,8 +4298,6 @@ void setup() {
   digitalWrite(LCD_CS, HIGH);
   pinMode(LORA_CS, OUTPUT);
   digitalWrite(LORA_CS, HIGH);
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
 
   pinMode(JOY_X, INPUT);
   pinMode(JOY_Y, INPUT);
@@ -4395,7 +4356,7 @@ void loop() {
       case WIFI_PAGE: buildWifi(); break;
       case GPS_PAGE: buildGPS(); break;
       case LORA_PAGE: buildLoRa(); break;
-      case SD_PAGE: buildSD(); break;
+      case NRF24_PAGE: buildNRF24(); break;
       case IR_PAGE: buildIR(); break;
       case CLOCK_PAGE: buildClock(); break;
       case DATE_PAGE: buildDate(); break;

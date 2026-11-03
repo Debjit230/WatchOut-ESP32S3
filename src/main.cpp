@@ -48,7 +48,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Custom QR options
 #define QR_AP_SSID   "WatchOut-QR"   // hotspot used when no Wi-Fi is available
 #define QR_AP_PASS   "watchout123"   // min 8 characters
-#define QR_MAX_TEXT  300
+#define QR_MAX_TEXT  367
 
 #define FW_VERSION "v1.9"
 
@@ -2694,11 +2694,47 @@ uint8_t qrBuf[700];                 // enough for version 12 (65x65 modules)
 bool qrValid = false;
 String qrCachedText = "\x01";       // text the current qrCode was made from
 
+bool qrFitsVersion(const String &text, uint8_t version) {
+  static const uint16_t lowEccDataBits[] = {
+    152, 272, 440, 640, 864, 1088, 1248, 1552, 1856, 2192, 2592, 2960
+  };
+  if (version < 1 || version > sizeof(lowEccDataBits) / sizeof(lowEccDataBits[0])) return false;
+
+  bool numeric = true;
+  bool alphanumeric = true;
+  for (unsigned int i = 0; i < text.length(); i++) {
+    char c = text[i];
+    if (c < '0' || c > '9') numeric = false;
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+          c == ' ' || c == '$' || c == '%' || c == '*' || c == '+' ||
+          c == '-' || c == '.' || c == '/' || c == ':')) {
+      alphanumeric = false;
+    }
+  }
+
+  uint32_t length = text.length();
+  uint32_t countBits;
+  uint32_t dataBits;
+  if (numeric) {
+    countBits = version <= 9 ? 10 : 12;
+    dataBits = (length / 3) * 10 + (length % 3 ? (length % 3) * 3 + 1 : 0);
+  } else if (alphanumeric) {
+    countBits = version <= 9 ? 9 : 11;
+    dataBits = (length / 2) * 11 + (length % 2 ? 6 : 0);
+  } else {
+    countBits = version <= 9 ? 8 : 16;
+    dataBits = length * 8;
+  }
+
+  return 4 + countBits + dataBits <= lowEccDataBits[version - 1];
+}
+
 // Smallest version (1..12) that fits the text, low error correction = most data
 bool qrMake(const String &t) {
   qrValid = false;
   if (t.length() == 0) return false;
   for (uint8_t v = 1; v <= 12; v++) {
+    if (!qrFitsVersion(t, v)) continue;
     if (qrcode_getBufferSize(v) > sizeof(qrBuf)) break;
     if (qrcode_initText(&qrCode, qrBuf, v, ECC_LOW, t.c_str()) == 0) {
       qrValid = true;
@@ -2765,7 +2801,7 @@ p{color:#aaa;font-size:14px;margin:4px 0}
 #s{margin-top:14px;font-size:16px;color:#6cf;min-height:20px}
 </style></head><body>
 <h2>WatchOut QR</h2>
-<textarea id=t maxlength=300 placeholder="Type text or a link"></textarea>
+<textarea id=t maxlength=367 placeholder="Type text or a link"></textarea>
 <button onclick="send()">Send to watch</button>
 <h3>Or send a picture</h3>
 <p>Pick a picture that contains a QR code. The watch will draw it again.</p>
@@ -2779,7 +2815,7 @@ function send(){
   if(!v){st('Type something first');return}
   fetch('/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:'t='+encodeURIComponent(v)})
-  .then(function(r){st(r.ok?'Sent to watch!':'Error '+r.status)})
+  .then(function(r){if(r.ok){st('Sent to watch!')}else{r.text().then(function(m){st(m||('Error '+r.status))})}})
   .catch(function(){st('Connection lost')})
 }
 async function pic(file){
@@ -2831,7 +2867,10 @@ void qrHandleSet() {
   String t = qrServer.arg("t");
   t.trim();
   if (t.length() == 0) { qrServer.send(400, "text/plain", "Empty"); return; }
-  if (t.length() > QR_MAX_TEXT) t = t.substring(0, QR_MAX_TEXT);
+  if (t.length() > QR_MAX_TEXT) {
+    qrServer.send(413, "text/plain", "Text too long (maximum 367 bytes)");
+    return;
+  }
   qrCustomText = t;
   qrSaveText();
   qrServer.send(200, "text/plain", "OK");
@@ -3011,7 +3050,7 @@ void renderQR() {
     g->print(text.length() ? "Text too long" : "No text");
   } else {
     int n = qrCode.size;
-    int scale = 240 / (n + 4);                      // leaves a 2 module quiet zone
+    int scale = 240 / (n + 8);                      // reserve the required 4-module quiet zone
     if (scale < 1) scale = 1;
     int px = n * scale;
     int ox = (240 - px) / 2;

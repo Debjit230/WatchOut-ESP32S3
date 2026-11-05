@@ -50,6 +50,12 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define QR_AP_PASS   "watchout123"   // min 8 characters
 #define QR_MAX_TEXT  367
 
+// Information QR options
+#define QR_OWNER_NAME   "Owner"
+#define QR_OWNER_PHONE  ""
+#define QR_MUSIC_LINK   "https://youtu.be/Iv7ls3mzPOU?si=00hSNs1WDqglteju"   // <-- put your favourite music / playlist link here
+#define QR_SECRET_TEXT  "Hello Cuties😘"
+
 // Animation / display tuning
 #define LCD_SPI_HZ   40000000        // try 80000000 for even faster frames if your wiring is short and clean
 #define FRAME_MS     16              // ~60 fps target (real rate is limited by the SPI transfer time)
@@ -57,7 +63,15 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define INTRO_SECS   0.30f           // slide/fade-in time when a page or sub menu opens
 #define BL_FADE_RATE 0.14f           // backlight fade speed (0..1 per step)
 
-#define FW_VERSION "v2.0"
+// NRF24 spectrum analyzer tuning
+#define NRF_SAMPLES      4           // RPD samples per channel per sweep (more = smoother but slower)
+#define NRF_DWELL_US     140         // listen time per sample (the radio needs ~130 us to settle)
+#define NRF_SLICE_US     6000        // max time spent scanning per loop pass (keeps the UI responsive)
+#define NRF_ATTACK       0.65f       // how fast a bar rises (0..1 per sweep)
+#define NRF_RELEASE      0.22f       // how fast a bar falls (0..1 per sweep)
+#define NRF_PEAK_DECAY   0.7f        // peak-hold marker fall speed (percent per sweep)
+
+#define FW_VERSION "v2.2"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -94,9 +108,24 @@ TinyGPSPlus gps;
 BLEScan *bleScan = nullptr;
 RF24 nrf24(NRF24_CE, NRF24_CSN);
 bool nrf24Ready = false;
-bool nrf24Scanned = false;
-uint8_t nrf24Activity[84] = {};
-unsigned long nrf24LastScan = 0;
+bool nrf24Scanned = false;           // true once the first full sweep has finished
+
+// ---- NRF24 spectrum analyzer state ----
+#define NRF_CH        84             // channels 0..83 = 2400..2483 MHz, 1 MHz apart
+#define NRF_WF_ROWS   93             // waterfall history (2 px per row)
+uint8_t nrf24Activity[NRF_CH] = {};  // latest sweep, 0..100 %
+float   nrfAvg[NRF_CH]   = {};       // smoothed activity (fast attack, slow release)
+float   nrfPeak[NRF_CH]  = {};       // peak-hold markers
+float   nrfShown[NRF_CH] = {};       // what is drawn (glides towards nrfAvg)
+uint8_t nrfHits[NRF_CH]  = {};       // hits collected by the sweep in progress
+uint8_t nrfWf[NRF_WF_ROWS][NRF_CH];  // waterfall history, newest row at nrfWfHead
+int     nrfWfHead = 0;
+uint8_t nrfScanCh = 0;               // channel the running sweep is on
+bool    nrfHold = false;             // long press = freeze the display
+uint8_t nrfView = 0;                 // 0 bars + peak hold, 1 waterfall, 2 Wi-Fi channel load
+uint32_t nrfSweeps = 0;
+float   nrfSweepRate = 0.0f;         // sweeps per second
+unsigned long nrfLastRow = 0;
 
 GFXcanvas16 *canvas = nullptr;
 bool canvasReady = false;
@@ -189,8 +218,10 @@ void goBackToMenu();
 void saveSettings();
 void startLoRa();
 void startNRF24();
+void nrfSpectrumBegin();
 void scanNRF24Spectrum();
 void pollNRF24Spectrum();
+bool nrfLongClick();
 void buildNRF24();
 void renderNRFSpectrum();
 void buildWifi();
@@ -310,7 +341,7 @@ String savedPass = "";
 bool radarOn = false;
 
 // ---------------- QR page state ----------------
-// QR sub views: 0 menu, 1 fake QR list, 2 custom QR (web page)
+// QR sub views: 0 menu, 1 information QR list, 2 custom QR (web page)
 bool qrShowing = false;             // true = a QR code is drawn full screen
 String qrCustomText = "";           // text received from the phone (stored in flash)
 
@@ -2268,6 +2299,15 @@ void startLoRa() {
   }
 }
 
+// ======================= NRF24 SPECTRUM ANALYZER =======================
+// * continuous, non-blocking sweep of all 84 channels (2400..2483 MHz), a few ms per loop pass
+// * several RPD samples per channel, smoothed with fast attack / slow release
+// * three views (click to cycle): BARS (+ peak hold), FALL (waterfall history), WIFI (load per Wi-Fi channel 1..13)
+// * long press = HOLD / resume (resume also clears the peak markers)
+// * Wi-Fi channel n is centred on 2407 + 5n MHz, i.e. nRF channel 7 + 5n
+// RPD only reports "signal stronger than -64 dBm on this channel", so the percentage is how often
+// the channel was busy, not a calibrated power level.
+
 void startNRF24() {
   digitalWrite(LCD_CS, HIGH);
   digitalWrite(LORA_CS, HIGH);
@@ -2282,40 +2322,107 @@ void startNRF24() {
   nrf24.stopListening();
 }
 
-void scanNRF24Spectrum() {
+// Called every time the Spectrum sub view opens: clears all history and restarts the sweep
+void nrfSpectrumBegin() {
+  memset(nrf24Activity, 0, sizeof(nrf24Activity));
+  memset(nrfAvg, 0, sizeof(nrfAvg));
+  memset(nrfPeak, 0, sizeof(nrfPeak));
+  memset(nrfShown, 0, sizeof(nrfShown));
+  memset(nrfHits, 0, sizeof(nrfHits));
+  memset(nrfWf, 0, sizeof(nrfWf));
+  nrfWfHead = 0;
+  nrfScanCh = 0;
+  nrfHold = false;
+  nrfSweeps = 0;
+  nrfSweepRate = 0.0f;
+  nrfLastRow = 0;
   nrf24Scanned = false;
-  if (!nrf24Ready || !nrf24.isChipConnected()) {
-    nrf24Ready = false;
-    return;
-  }
-
-  const uint8_t sampleCount = 4;
-  for (uint8_t channel = 0; channel < 84; channel++) {
-    uint8_t busySamples = 0;
-    for (uint8_t sample = 0; sample < sampleCount; sample++) {
-      nrf24.stopListening();
-      nrf24.setChannel(channel);
-      nrf24.startListening();
-      delayMicroseconds(140);
-      if (nrf24.testRPD()) busySamples++;
-    }
-    nrf24.stopListening();
-    nrf24Activity[channel] = (uint8_t)(busySamples * 100 / sampleCount);
-  }
-
-  nrf24.setChannel(76);
-  nrf24.startListening();
-  nrf24Scanned = true;
-  lastDraw = 0;
+  if (!nrf24Ready || !nrf24.isChipConnected()) startNRF24();   // retry if the radio was missing before
   uiDirty = true;
 }
 
-void pollNRF24Spectrum() {
-  if (page != NRF24_PAGE || subView != 2 || !nrf24Ready) return;
+// A full sweep just finished: update smoothing, peaks, waterfall and the sweep rate
+static void nrfFinishSweep() {
   unsigned long now = millis();
-  if (now - nrf24LastScan < 250) return;
-  nrf24LastScan = now;
+  bool pushRow = (now - nrfLastRow >= 80);
+  if (pushRow) {
+    nrfWfHead = (nrfWfHead + 1) % NRF_WF_ROWS;
+    nrfLastRow = now;
+  }
+
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    float inst = (float)nrfHits[ch] * 100.0f / (float)NRF_SAMPLES;
+    nrf24Activity[ch] = (uint8_t)lroundf(inst);
+
+    float a = nrfAvg[ch];
+    a += (inst - a) * (inst > a ? NRF_ATTACK : NRF_RELEASE);
+    nrfAvg[ch] = a;
+
+    if (a >= nrfPeak[ch]) {
+      nrfPeak[ch] = a;
+    } else {
+      nrfPeak[ch] -= NRF_PEAK_DECAY;
+      if (nrfPeak[ch] < a) nrfPeak[ch] = a;
+    }
+    if (pushRow) nrfWf[nrfWfHead][ch] = (uint8_t)lroundf(a);
+  }
+
+  nrfSweeps++;
+  static uint32_t markSweeps = 0;
+  static unsigned long markT = 0;
+  if (now - markT >= 1000) {
+    if (markT != 0) nrfSweepRate = (float)(nrfSweeps - markSweeps) * 1000.0f / (float)(now - markT);
+    markSweeps = nrfSweeps;
+    markT = now;
+  }
+
+  if (!nrf24.isChipConnected()) {                  // radio unplugged / lost power
+    nrf24Ready = false;
+    return;
+  }
+  nrf24Scanned = true;
+  uiDirty = true;
+}
+
+// Scans as many channels as fit into NRF_SLICE_US, then returns so the UI keeps running
+void scanNRF24Spectrum() {
+  if (!nrf24Ready) return;
+  unsigned long t0 = micros();
+  while (micros() - t0 < (unsigned long)NRF_SLICE_US) {
+    uint8_t ch = nrfScanCh;
+    uint8_t hits = 0;
+    for (uint8_t s = 0; s < NRF_SAMPLES; s++) {
+      nrf24.setChannel(ch);
+      nrf24.startListening();
+      delayMicroseconds(NRF_DWELL_US);
+      nrf24.stopListening();
+      if (nrf24.testRPD()) hits++;
+    }
+    nrfHits[ch] = hits;
+    nrfScanCh++;
+    if (nrfScanCh >= NRF_CH) {
+      nrfScanCh = 0;
+      nrfFinishSweep();
+      break;
+    }
+  }
+}
+
+void pollNRF24Spectrum() {
+  if (page != NRF24_PAGE || subView != 2 || !nrf24Ready || nrfHold) return;
   scanNRF24Spectrum();
+}
+
+// Long press inside the spectrum = freeze / resume
+bool nrfLongClick() {
+  if (page != NRF24_PAGE || subView != 2) return false;
+  nrfHold = !nrfHold;
+  if (!nrfHold) {                                  // resuming: restart the peak markers
+    for (int ch = 0; ch < NRF_CH; ch++) nrfPeak[ch] = nrfAvg[ch];
+  }
+  ledFlash(255, 159, 10, 200);
+  uiDirty = true;
+  return true;
 }
 
 void buildNRF24Info() {
@@ -2334,6 +2441,8 @@ void buildNRF24Info() {
   addLine("Data rate", "1 Mbps", C_MUTED, C_WHITE);
   addLine("Power", "MIN", C_MUTED, C_WHITE);
   addLine("ISM range", "2400-2483 MHz", C_MUTED, C_WHITE);
+  addLine("Samples/ch", String(NRF_SAMPLES), C_MUTED, C_WHITE);
+  addLine("Sweeps/s", String(nrfSweepRate, 1), C_MUTED, C_WHITE);
 }
 
 void buildNRF24() {
@@ -2354,64 +2463,242 @@ void buildNRF24() {
   finishLines();
 }
 
-// NRF24 spectrum bars glide to their new values instead of snapping
-float nrfShown[84] = {};
+// Heat map colour for 0..100 %: dark blue -> cyan -> yellow -> red
+static uint16_t nrfHeat(float v) {
+  if (v < 0.0f) v = 0.0f;
+  if (v > 100.0f) v = 100.0f;
+  float t = v / 100.0f;
+  float r, g, b;
+  if (t < 0.33f) {
+    float k = t / 0.33f;
+    r = 0; g = 200.0f * k; b = 60.0f + 140.0f * k;
+  } else if (t < 0.66f) {
+    float k = (t - 0.33f) / 0.33f;
+    r = 255.0f * k; g = 200.0f + 55.0f * k; b = 200.0f * (1.0f - k);
+  } else {
+    float k = (t - 0.66f) / 0.34f;
+    r = 255; g = 255.0f * (1.0f - k); b = 0;
+  }
+  return rgb565((uint8_t)r, (uint8_t)g, (uint8_t)b);
+}
+
+// Load of Wi-Fi channel n (1..13) in percent: weighted mean over its 22 MHz width blended with the strongest inner channel
+static float nrfWifiLoad(int n) {
+  int c = 7 + 5 * n;
+  float sum = 0.0f, wsum = 0.0f, mx = 0.0f;
+  for (int d = -10; d <= 10; d++) {
+    int ch = c + d;
+    if (ch < 0 || ch >= NRF_CH) continue;
+    float w = 1.0f - fabsf((float)d) / 12.0f;
+    sum += nrfShown[ch] * w;
+    wsum += w;
+    if (d >= -4 && d <= 4 && nrfShown[ch] > mx) mx = nrfShown[ch];
+  }
+  float mean = wsum > 0.0f ? sum / wsum : 0.0f;
+  return (mean + mx) * 0.5f;
+}
 
 void renderNRFSpectrum() {
   Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
   g->fillScreen(bgColor());
-  boldText(g, 10, 8, "NRF24 SPECTRUM", themeColor(C_CYAN), 2, 1);
+
+  static const char *VIEW_NAMES[] = {"BARS", "FALL", "WIFI"};
+  const uint16_t cW = themeColor(C_WHITE);
+  const uint16_t cM = themeColor(C_MUTED);
+
+  boldText(g, 10, 8, String("NRF24 ") + VIEW_NAMES[nrfView], themeColor(C_CYAN), 2, 1);
+  if (nrfHold) boldText(g, 228 - 48, 8, "HOLD", themeColor(C_RED), 2, 1);
 
   if (!nrf24Ready) {
     boldText(g, 10, 90, "RADIO NOT FOUND", themeColor(C_RED), 2, 1);
     boldText(g, 10, 116, "Check wiring and 3.3V", themeColor(C_MUTED), 1, 1);
-  } else if (!nrf24Scanned) {
-    boldText(g, 10, 90, "No scan yet", themeColor(C_YELLOW), 2, 1);
+    flushCanvas();
+    return;
+  }
+  if (!nrf24Scanned) {
+    boldText(g, 10, 90, "Scanning...", themeColor(C_YELLOW), 2, 1);
+    flushCanvas();
+    return;
+  }
+
+  const int L = 24, R = 232, T = 55, B = 242, H = B - T;
+  const int W = R - L;
+
+  // glide the drawn values towards the smoothed ones; keep redrawing until they settle
+  bool moving = false;
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    float diff = nrfAvg[ch] - nrfShown[ch];
+    if (fabsf(diff) > 0.4f) {
+      nrfShown[ch] += diff * 0.35f;
+      moving = true;
+    } else {
+      nrfShown[ch] = nrfAvg[ch];
+    }
+  }
+  if (moving) uiDirty = true;
+
+  // strongest channel + average occupancy
+  int pk = 0;
+  float total = 0.0f;
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    if (nrfShown[ch] > nrfShown[pk]) pk = ch;
+    total += nrfShown[ch];
+  }
+  int avgBusy = (int)lroundf(total / (float)NRF_CH);
+
+  // wifi load (needed for the WIFI view and the "best channel" hint)
+  float wl[13];
+  int bestWifi = 0;
+  for (int n = 1; n <= 13; n++) {
+    wl[n - 1] = nrfWifiLoad(n);
+    if (wl[n - 1] < wl[bestWifi]) bestWifi = n - 1;
+  }
+
+  // info lines
+  String info;
+  if (nrfView == 2) info = "BEST CH " + String(bestWifi + 1) + " (" + String((int)lroundf(wl[bestWifi])) + "% busy)";
+  else info = "PEAK " + String(2400 + pk) + " MHz " + String((int)lroundf(nrfShown[pk])) + "%";
+  g->setTextSize(1);
+  g->setTextWrap(false);
+  g->setTextColor(cM);
+  g->setCursor(10, 29);
+  g->print(info);
+  g->setCursor(10, 41);
+  g->print(String("AVG ") + String(avgBusy) + "%");
+  String rate = String(nrfSweepRate, 1) + " sw/s";
+  g->setCursor(232 - (int)rate.length() * 6, 41);
+  g->print(rate);
+
+  if (nrfView == 1) {
+    // ---------------- WATERFALL ----------------
+    const uint16_t dark = rgb565(0, 0, 24);
+    g->fillRect(L, T, W, H, dark);
+    static uint16_t lut[101];
+    for (int v = 0; v <= 100; v++) lut[v] = (v < 3) ? dark : nrfHeat((float)v);
+    uint8_t colCh[W];
+    for (int x = 0; x < W; x++) colCh[x] = (uint8_t)(x * NRF_CH / W);
+
+    if (canvasReady) {                                // fast path: write straight into the frame buffer
+      uint16_t *buf = canvas->getBuffer();
+      for (int a = 0; a < NRF_WF_ROWS; a++) {
+        const uint8_t *row = nrfWf[(nrfWfHead - a + NRF_WF_ROWS) % NRF_WF_ROWS];
+        int y = T + a * 2;
+        if (y + 1 >= B + 1) break;
+        uint16_t *p0 = buf + (size_t)y * 240 + L;
+        uint16_t *p1 = p0 + 240;
+        for (int x = 0; x < W; x++) {
+          uint16_t c = lut[row[colCh[x]] > 100 ? 100 : row[colCh[x]]];
+          p0[x] = c;
+          p1[x] = c;
+        }
+      }
+    } else {
+      for (int a = 0; a < NRF_WF_ROWS; a++) {
+        const uint8_t *row = nrfWf[(nrfWfHead - a + NRF_WF_ROWS) % NRF_WF_ROWS];
+        int y = T + a * 2;
+        for (int ch = 0; ch < NRF_CH; ch++) {
+          if (row[ch] < 3) continue;
+          int x0 = L + W * ch / NRF_CH;
+          int x1 = L + W * (ch + 1) / NRF_CH;
+          g->fillRect(x0, y, max(1, x1 - x0), 2, nrfHeat((float)row[ch]));
+        }
+      }
+    }
+    g->drawRect(L - 1, T - 1, W + 2, H + 2, cM);
   } else {
-    boldText(g, 10, 29, "Channel activity above -64 dBm", themeColor(C_WHITE), 1, 1);
-
-    const int graphLeft = 24;
-    const int graphRight = 232;
-    const int graphTop = 55;
-    const int graphBottom = 242;
-    const int graphHeight = graphBottom - graphTop;
-
+    // grid + axis labels
     for (int level = 0; level <= 100; level += 25) {
-      int y = graphBottom - (graphHeight * level / 100);
-      g->drawFastHLine(graphLeft, y, graphRight - graphLeft, themeColor(C_MUTED));
+      int y = B - (H * level / 100);
+      g->drawFastHLine(L, y, W, lightMode ? 0xDEFB : 0x2104);
       g->setTextSize(1);
-      g->setTextColor(themeColor(C_WHITE));
+      g->setTextColor(cW);
       g->setCursor(2, y - 3);
       g->print(level);
     }
 
-    bool moving = false;
-    for (uint8_t channel = 0; channel < 84; channel++) {
-      float goal = (float)nrf24Activity[channel];
-      float diff = goal - nrfShown[channel];
-      if (fabsf(diff) > 0.5f) {
-        nrfShown[channel] += diff * 0.28f;
-        moving = true;
-      } else {
-        nrfShown[channel] = goal;
-      }
-      int x0 = graphLeft + (graphRight - graphLeft) * channel / 84;
-      int x1 = graphLeft + (graphRight - graphLeft) * (channel + 1) / 84;
-      int barHeight = (int)(graphHeight * nrfShown[channel] / 100.0f);
-      if (barHeight <= 0) continue;
-      uint16_t color = nrfShown[channel] >= 75 ? C_RED :
-                       (nrfShown[channel] >= 25 ? C_YELLOW : C_GREEN);
-      g->fillRect(x0, graphBottom - barHeight, max(1, x1 - x0), barHeight,
-                  themeColor(color));
-    }
-    if (moving) uiDirty = true;                    // keep animating until the bars settle
+    if (nrfView == 0) {
+      // ---------------- BARS + PEAK HOLD ----------------
+      const int SEG = 4;
+      const int segN = H / SEG;
+      uint16_t lut[segN];
+      for (int k = 0; k < segN; k++) lut[k] = themeColor(nrfHeat(((float)k + 0.5f) * 100.0f / (float)segN));
 
+      for (int ch = 0; ch < NRF_CH; ch++) {
+        int x0 = L + W * ch / NRF_CH;
+        int x1 = L + W * (ch + 1) / NRF_CH;
+        int bw = x1 - x0;
+        if (bw >= 3) bw -= 1;                           // thin gap between wide bars
+        int bh = (int)(H * nrfShown[ch] / 100.0f);
+        if (bh > H) bh = H;
+
+        int full = bh / SEG;
+        for (int k = 0; k < full && k < segN; k++) {
+          g->fillRect(x0, B - (k + 1) * SEG, bw, SEG, lut[k]);
+        }
+        int rem = bh - full * SEG;
+        if (rem > 0 && full < segN) g->fillRect(x0, B - bh, bw, rem, lut[full]);
+
+        int ph = (int)(H * nrfPeak[ch] / 100.0f);
+        if (ph > bh + 1 && ph <= H) g->fillRect(x0, B - ph - 1, bw, 2, cW);
+      }
+    } else {
+      // ---------------- WI-FI CHANNEL LOAD ----------------
+      const int bwAll = W / 13;                         // 16 px per channel
+      for (int n = 1; n <= 13; n++) {
+        int x = L + (n - 1) * bwAll + 1;
+        int bw = bwAll - 2;
+        int bh = (int)(H * wl[n - 1] / 100.0f);
+        if (bh > H) bh = H;
+        if (bh > 0) g->fillRoundRect(x, B - bh, bw, bh, 2, themeColor(nrfHeat(wl[n - 1])));
+        String pct = String((int)lroundf(wl[n - 1]));
+        int ty = B - bh - 10;
+        if (ty < T - 4) ty = T - 4;
+        g->setTextSize(1);
+        g->setTextColor(cW);
+        g->setCursor(x + (bw - (int)pct.length() * 6) / 2, ty);
+        g->print(pct);
+      }
+    }
+
+    g->drawFastHLine(L, B, W, cM);
+  }
+
+  // x axis
+  if (nrfView == 2) {
+    const int bwAll = W / 13;
+    for (int n = 1; n <= 13; n++) {
+      String s = String(n);
+      int x = L + (n - 1) * bwAll + 1 + (bwAll - 2 - (int)s.length() * 6) / 2;
+      g->setTextSize(1);
+      g->setTextColor(n - 1 == bestWifi ? themeColor(C_GREEN) : cW);
+      g->setCursor(x, B + 6);
+      g->print(s);
+    }
+    g->setTextColor(cM);
+    g->setCursor(L, 262);
+    g->print("Wi-Fi channel load");
+  } else {
+    // Wi-Fi channel ticks: channel n is centred on nRF channel 7 + 5n
+    for (int n = 1; n <= 13; n++) {
+      int x = L + (int)lroundf((float)W * (7.0f + 5.0f * n + 0.5f) / (float)NRF_CH);
+      g->drawFastVLine(x, B + 1, 3, cM);
+      if (n == 1 || n == 6 || n == 11 || n == 13) {
+        String s = String(n);
+        g->setTextSize(1);
+        g->setTextColor(n == 13 ? cM : cW);
+        g->setCursor(x - (int)s.length() * 3, B + 6);
+        g->print(s);
+      }
+    }
     g->setTextSize(1);
-    g->setTextColor(themeColor(C_WHITE));
-    g->setCursor(graphLeft, 248);
-    g->print("2400 MHz");
-    g->setCursor(graphRight - 48, 248);
-    g->print("2483 MHz");
+    g->setTextColor(cM);
+    g->setCursor(L, 262);
+    g->print("2400");
+    String mid = "Wi-Fi ch";
+    g->setCursor((240 - (int)mid.length() * 6) / 2, 262);
+    g->print(mid);
+    g->setCursor(R - 24, 262);
+    g->print("2483");
   }
 
   flushCanvas();
@@ -2865,7 +3152,7 @@ bool loraLongClick() {
 }
 
 // ======================= QR CODE =======================
-// QR sub views: 0 menu (Fake QR Code / Custom QR), 1 fake QR list, 2 custom QR (phone web page)
+// QR sub views: 0 menu (Information QR / Custom QR), 1 information QR list, 2 custom QR (phone web page)
 // A QR code is drawn black on white (always, so phone cameras can read it) by renderQR().
 
 QRCode qrCode;
@@ -2923,11 +3210,12 @@ bool qrMake(const String &t) {
   return false;
 }
 
-// ---- Fake QR codes ----
-const int FAKE_COUNT = 8;
+// ---- Information QR codes ----
+// Order on the watch: Contact, GitHub, Music, Free Wi-Fi, Google, Secret Msg, My Wi-Fi
+const int FAKE_COUNT = 7;
 const char *FAKE_NAMES[FAKE_COUNT] = {
-  "Rickroll", "Free Wi-Fi", "Hello World", "Google",
-  "GitHub", "Fake Contact", "Secret Msg", "My Wi-Fi"
+  "Contact", "GitHub", "Music", "Free Wi-Fi",
+  "Google", "Secret Msg", "My Wi-Fi"
 };
 
 String qrEsc(const String &s) {     // escape for the WIFI:... QR format
@@ -2942,15 +3230,19 @@ String qrEsc(const String &s) {     // escape for the WIFI:... QR format
 
 String fakePayload(int i) {
   switch (i) {
-    case 0: return "https://youtu.be/dQw4w9WgXcQ";
-    case 1: return "WIFI:T:nopass;S:Free Wi-Fi;;";
-    case 2: return "Hello World from WATCHOUT!";
-    case 3: return "https://www.google.com";
-    case 4: return "https://github.com";
-    case 5: return "BEGIN:VCARD\nVERSION:3.0\nFN:John Doe\nTEL:+10000000000\nEMAIL:john@example.com\nEND:VCARD";
-    case 6: return "You found the secret message!";
-    default: {                                     // join the Wi-Fi saved by Connect AP
-      if (savedSsid.length() == 0) return "WIFI:T:WPA;S:Home Wi-Fi;P:password123;;";   // placeholder
+    case 0: {                                      // Contact (vCard): scanning offers "Add contact"
+      String contact = String("BEGIN:VCARD\nVERSION:3.0\nFN:") + QR_OWNER_NAME;
+      if (QR_OWNER_PHONE[0] != '\0')
+        contact += String("\nTEL;TYPE=CELL:") + QR_OWNER_PHONE;
+      return contact + "\nEND:VCARD";
+    }
+    case 1: return "https://github.com";
+    case 2: return QR_MUSIC_LINK;
+    case 3: return "WIFI:T:nopass;S:Free Wi-Fi;;";
+    case 4: return "https://www.google.com";
+    case 5: return QR_SECRET_TEXT;
+    default: {                                     // My Wi-Fi: share the last network connected through Connect AP
+      if (savedSsid.length() == 0) return "No saved Wi-Fi. Use Wi-Fi > Connect AP first.";
       if (savedPass.length() == 0) return "WIFI:T:nopass;S:" + qrEsc(savedSsid) + ";;";
       return "WIFI:T:WPA;S:" + qrEsc(savedSsid) + ";P:" + qrEsc(savedPass) + ";;";
     }
@@ -3133,7 +3425,7 @@ void qrPoll() {
 
 // ---- screens ----
 void buildQRMenu() {
-  addLine("Fake QR Code", "", C_WHITE, C_WHITE);
+  addLine("Information QR", "", C_WHITE, C_WHITE);
   addLine("Custom QR", qrCustomText.length() ? "SAVED" : "", C_WHITE, C_GREEN);
 }
 
@@ -3204,6 +3496,7 @@ String qrCurrentText(String &title) {
     if (i < 0) i = 0;
     if (i >= FAKE_COUNT) i = FAKE_COUNT - 1;
     title = FAKE_NAMES[i];
+    if (i == FAKE_COUNT - 1 && savedSsid.length()) title = String("Wi-Fi: ") + savedSsid;
     return fakePayload(i);
   }
   title = "Custom QR";
@@ -3929,7 +4222,7 @@ void ledAuto() {
       if (loraOK) { r = 0; g = 255; b = 0; period = 3000; }
       else { r = 255; g = 0; b = 0; style = 1; period = 600; }
       break;
-    case NRF24_PAGE: c565to888(appColor(4), r, g, b); style = (subView == 2 && nrf24Ready) ? 2 : 0; period = 1500; break;
+    case NRF24_PAGE: c565to888(appColor(4), r, g, b); style = (subView == 2 && nrf24Ready && !nrfHold) ? 2 : 0; period = 1500; break;
     case IR_PAGE: c565to888(appColor(5), r, g, b); style = (subView == 1 && !irCaptured) ? 2 : 0; period = 1500; break;
     case CLOCK_PAGE: c565to888(appColor(6), r, g, b); period = 4000; break;
     case DATE_PAGE: c565to888(appColor(7), r, g, b); style = 0; break;
@@ -4019,7 +4312,7 @@ void enterPage(Page p) {
     case CLOCK_PAGE: buildClock(); break;
     case DATE_PAGE: buildDate(); break;
     case WEATHER_PAGE: wxState = 0; fetchWeather(); buildWeather(); break;
-    case QR_PAGE: buildQR(); break;             // starts on the QR sub menu (Fake / Custom)
+    case QR_PAGE: buildQR(); break;             // starts on the QR sub menu (Information / Custom)
     case CONFIG_PAGE: buildConfig(); break;
     case FACE_PAGE: startLines(); lastFaceKey = 0xFFFFFFFF; break;
   }
@@ -4047,6 +4340,7 @@ void loadSettings() {
   savedSsid       = prefs.getString("wssid", "");
   savedPass       = prefs.getString("wpass", "");
   qrCustomText    = prefs.getString("qrtxt", "");
+  nrfView         = prefs.getUChar("nrfv", 0);
   prefs.end();
 
   if (qrCustomText.length() > QR_MAX_TEXT) qrCustomText = qrCustomText.substring(0, QR_MAX_TEXT);
@@ -4059,6 +4353,7 @@ void loadSettings() {
   if (ledLevelIdx < 0 || ledLevelIdx > 4) ledLevelIdx = 2;
   if (customProto < 0 || customProto >= CUSTOM_PROTO_COUNT) customProto = 0;
   if (customRepeats < 0 || customRepeats > 3) customRepeats = 0;
+  if (nrfView > 2) nrfView = 0;
   screenBrightness = brightLevels[configSelection];
 }
 
@@ -4076,6 +4371,7 @@ void saveSettings() {
   prefs.putUChar("ca", customAddr);
   prefs.putUChar("cc", customCmd);
   prefs.putUChar("cr", customRepeats);
+  prefs.putUChar("nrfv", nrfView);
   prefs.end();
 }
 
@@ -4178,8 +4474,13 @@ void nrf24Click() {
     pageSel = 0;
     scrollPos = 0.0f;
     scrollVel = 0.0f;
+    if (subView == 2) nrfSpectrumBegin();            // fresh history + restart the sweep
   } else if (subView == 1) {
     nrf24Ready = nrf24.isChipConnected();
+  } else if (subView == 2) {
+    nrfView = (nrfView + 1) % 3;                     // BARS -> FALL -> WIFI
+    saveSettings();
+    uiDirty = true;
   }
   buildNRF24();
 }
@@ -4496,7 +4797,7 @@ void pollJoystick() {
     btnDownAt = now;
   } else if (!down && buttonWasDown) {
     buttonWasDown = false;
-    if (now - btnDownAt >= 700 && (loraLongClick() || wifiLongClick())) {
+    if (now - btnDownAt >= 700 && (loraLongClick() || wifiLongClick() || nrfLongClick())) {
       lastDraw = millis();
     } else {
       singleClick();

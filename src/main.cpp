@@ -50,7 +50,14 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define QR_AP_PASS   "watchout123"   // min 8 characters
 #define QR_MAX_TEXT  367
 
-#define FW_VERSION "v1.9"
+// Animation / display tuning
+#define LCD_SPI_HZ   40000000        // try 80000000 for even faster frames if your wiring is short and clean
+#define FRAME_MS     16              // ~60 fps target (real rate is limited by the SPI transfer time)
+#define SCROLL_K     420.0f          // spring stiffness for list scrolling (higher = snappier)
+#define INTRO_SECS   0.30f           // slide/fade-in time when a page or sub menu opens
+#define BL_FADE_RATE 0.14f           // backlight fade speed (0..1 per step)
+
+#define FW_VERSION "v2.0"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -93,6 +100,15 @@ unsigned long nrf24LastScan = 0;
 
 GFXcanvas16 *canvas = nullptr;
 bool canvasReady = false;
+
+// One burst transfer of the whole frame buffer (much faster than per-pixel drawing)
+void flushCanvas() {
+  if (!canvasReady) return;
+  lcd.startWrite();
+  lcd.setAddrWindow(0, 0, 240, 280);
+  lcd.writePixels(canvas->getBuffer(), 240UL * 280UL, true, false);
+  lcd.endWrite();
+}
 
 // ---------------- COLORS ----------------
 static const uint16_t C_CYAN   = 0x07FF;
@@ -218,8 +234,11 @@ Line lines[MAX_LINES];
 int lineCount = 0;
 int pageSel = 0;
 float scrollPos = 0.0f;
+float scrollVel = 0.0f;          // spring velocity for smooth scrolling
+float introP = 1.0f;             // 0..1 page/sub menu intro progress (1 = finished)
 bool uiDirty = true;
 unsigned long lastFrame = 0;
+unsigned long lastAnimMs = 0;
 
 bool buttonWasDown = false;
 bool rightSwipeArmed = true;
@@ -243,6 +262,27 @@ const uint8_t DIM_LEVEL = 8;
 const char *ORI_NAMES[] = {"Normal", "Flip"};
 bool dimmed = false;
 unsigned long lastActivity = 0;
+
+// Smooth backlight (fades instead of jumping)
+float blCur = 220.0f;
+uint8_t blTarget = 220;
+
+void backlightUpdate() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 12) return;
+  last = now;
+  float d = (float)blTarget - blCur;
+  if (fabsf(d) < 0.6f) {
+    if ((int)lroundf(blCur) != (int)blTarget) {
+      blCur = (float)blTarget;
+      analogWrite(LCD_BL, blTarget);
+    }
+    return;
+  }
+  blCur += d * BL_FADE_RATE;
+  analogWrite(LCD_BL, (int)lroundf(blCur));
+}
 
 int subView = 0;
 int subParentSel = 0;
@@ -286,7 +326,7 @@ bool loraLongClick();
 bool wifiLongClick();
 void wifiBack();
 
-const uint32_t NAV_MS = 150;
+const uint32_t NAV_MS = 120;
 const uint32_t PAGE_REFRESH_MS = 1000;
 
 struct WifiEntry {
@@ -669,6 +709,17 @@ void drawGlyph(Adafruit_GFX *g, int i, int cx, int cy, float k, uint8_t br, uint
   }
 }
 
+// Eased intro factor (0..1) for a row at distance d from the selected row.
+// Rows closer to the selection appear first, the rest follow in a short cascade.
+float introEase(float d) {
+  if (introP >= 1.0f) return 1.0f;
+  float p = introP * 1.5f - d * 0.15f;
+  if (p < 0.0f) p = 0.0f;
+  if (p > 1.0f) p = 1.0f;
+  float q = 1.0f - p;
+  return 1.0f - q * q * q;                       // ease-out cubic
+}
+
 void drawAppRow(Adafruit_GFX *g, int i, float scroll) {
   float off = (float)i - scroll;
   int cy = LIST_CENTER_Y + (int)lroundf(off * ROW_H);
@@ -678,23 +729,26 @@ void drawAppRow(Adafruit_GFX *g, int i, float scroll) {
   float dNear = fminf(d, 1.0f);
   float k = 1.0f - 0.2f * dNear;
 
+  float e = introEase(d);
+  int xo = (int)lroundf((1.0f - e) * 36.0f);
+
   int brI = 255 - (int)(70.0f * d);
   if (brI < 100) brI = 100;
-  uint8_t br = (uint8_t)brI;
+  uint8_t br = (uint8_t)(brI * e);
 
   int R = (int)lroundf(ICON_R * k);
   uint16_t accent = dimc(appColor(i), br);
 
-  g->fillCircle(ICON_CX, cy, R, accent);
-  drawGlyph(g, i, ICON_CX, cy, k, br, accent);
+  g->fillCircle(ICON_CX + xo, cy, R, accent);
+  drawGlyph(g, i, ICON_CX + xo, cy, k, br, accent);
 
   uint16_t tc = dimc(themeColor(C_WHITE), br);
   g->setTextSize(2);
   g->setTextWrap(false);
   g->setTextColor(tc);
-  g->setCursor(TEXT_X, cy - 7);
+  g->setCursor(TEXT_X + xo, cy - 7);
   g->print(menuItems[i]);
-  g->setCursor(TEXT_X + 1, cy - 7);
+  g->setCursor(TEXT_X + xo + 1, cy - 7);
   g->print(menuItems[i]);
 }
 
@@ -716,11 +770,12 @@ void renderMenu() {
   g->fillScreen(bgColor());
   for (int i = 0; i < MENU_COUNT; i++) drawAppRow(g, i, scrollPos);
   drawScrollBar(g, scrollPos / (float)(MENU_COUNT - 1), 44);
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 void drawMenu() {
   scrollPos = (float)selected;
+  scrollVel = 0.0f;
   uiDirty = false;
   renderMenu();
 }
@@ -741,9 +796,12 @@ void drawLineRow(Adafruit_GFX *g, int i, float scroll) {
   if (cy < -20 || cy > 300) return;
 
   float d = fabsf(off);
+  float e = introEase(d);
+  int xo = (int)lroundf((1.0f - e) * 30.0f);
+
   int brI = 255 - (int)(55.0f * d);
   if (brI < 70) brI = 70;
-  uint8_t br = (uint8_t)brI;
+  uint8_t br = (uint8_t)(brI * e);
 
   String l = lines[i].l;
   String r = lines[i].r;
@@ -754,7 +812,7 @@ void drawLineRow(Adafruit_GFX *g, int i, float scroll) {
   if ((int)l.length() > maxL) l = l.substring(0, maxL);
 
   if (d < 0.5f) {
-    int mb = 255 - (int)(d * 510.0f);
+    int mb = (int)((255 - (int)(d * 510.0f)) * e);
     g->fillRoundRect(3, cy - 11, 3, 22, 1, dimc(themeColor(C_CYAN), (uint8_t)mb));
   }
 
@@ -762,14 +820,14 @@ void drawLineRow(Adafruit_GFX *g, int i, float scroll) {
     int bw = (int)l.length() * 24;
     int bx = (240 - bw) / 2;
     if (bx < 8) bx = 8;
-    boldText(g, bx, cy - 14, l, dimc(themeColor(lines[i].lc), br), 4, 2);
+    boldText(g, bx + xo, cy - 14, l, dimc(themeColor(lines[i].lc), br), 4, 2);
     return;
   }
 
-  boldText(g, TEXT_LEFT_X, cy - 7, l, dimc(themeColor(lines[i].lc), br), 2, 1);
+  boldText(g, TEXT_LEFT_X + xo, cy - 7, l, dimc(themeColor(lines[i].lc), br), 2, 1);
   if (r.length()) {
     int rx = TEXT_RIGHT_X - (int)r.length() * 12;
-    boldText(g, rx, cy - 7, r, dimc(themeColor(lines[i].rc), br), 2, 1);
+    boldText(g, rx + xo, cy - 7, r, dimc(themeColor(lines[i].rc), br), 2, 1);
   }
 }
 
@@ -782,7 +840,7 @@ void renderPage() {
     if (thumbH < 16) thumbH = 16;
     drawScrollBar(g, scrollPos / (float)(lineCount - 1), thumbH);
   }
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 const char *WEEKDAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
@@ -1083,7 +1141,7 @@ void renderFace() {
     g->print("Weather app syncs NTP time");
   }
 
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 // ======================= WI-FI RADAR =======================
@@ -1095,8 +1153,10 @@ struct RadarTarget {
   uint8_t mac[6];
   int rssi;
   float angle;
+  float dist;                 // smoothed distance from the centre (animated)
   unsigned long lastSeen;
   bool active;
+  bool fresh;                 // true = jump straight to the real distance on first draw
 };
 RadarTarget radarT[RADAR_MAX];
 portMUX_TYPE radarMux = portMUX_INITIALIZER_UNLOCKED;
@@ -1129,7 +1189,10 @@ static void radarRegister(const uint8_t *mac, int rssi) {
   memcpy(radarT[idx].mac, mac, 6);
   radarT[idx].rssi = rssi;
   radarT[idx].lastSeen = now;
-  if (!radarT[idx].active) radarT[idx].angle = (float)random(360) * DEG2RAD;
+  if (!radarT[idx].active) {
+    radarT[idx].angle = (float)random(360) * DEG2RAD;
+    radarT[idx].fresh = true;
+  }
   radarT[idx].active = true;
   portEXIT_CRITICAL(&radarMux);
   radarPkts = radarPkts + 1;
@@ -1221,12 +1284,13 @@ void renderRadar() {
 
   unsigned long now = millis();
 
-  // sweep line with a fading trail
+  // sweep line with a long, smooth fading trail
   float sw = (float)(now % 2400UL) / 2400.0f * 6.2831853f;
-  for (int k = 6; k >= 0; k--) {
-    float a = sw - k * 0.09f;
+  for (int k = 11; k >= 0; k--) {
+    float a = sw - k * 0.06f;
+    int br = 255 - k * 20;
     g->drawLine(cx, cy, cx + (int)lroundf(cosf(a) * R), cy + (int)lroundf(sinf(a) * R),
-                dimc(base, (uint8_t)(255 - k * 34)));
+                dimc(base, (uint8_t)br));
   }
   g->fillCircle(cx, cy, 3, base);
 
@@ -1248,9 +1312,16 @@ void renderRadar() {
     float t = (float)(snap[i].rssi + 95) / 60.0f;       // -95 dBm = edge, -35 dBm = centre
     if (t < 0) t = 0;
     if (t > 1) t = 1;
-    float d = (float)(R - 8) - t * (float)(R - 16);
-    int tx = cx + (int)lroundf(cosf(snap[i].angle) * d);
-    int ty = cy + (int)lroundf(sinf(snap[i].angle) * d);
+    float goal = (float)(R - 8) - t * (float)(R - 16);
+
+    // glide towards the real distance instead of jumping
+    float cur = (radarT[i].fresh || radarT[i].dist <= 0.0f) ? goal : radarT[i].dist;
+    cur += (goal - cur) * 0.18f;
+    radarT[i].dist = cur;
+    radarT[i].fresh = false;
+
+    int tx = cx + (int)lroundf(cosf(snap[i].angle) * cur);
+    int ty = cy + (int)lroundf(sinf(snap[i].angle) * cur);
 
     int br = 255 - (int)(age * 150UL / RADAR_TTL_MS);
     uint16_t col = dimc(themeColor(rssiColor(snap[i].rssi)), (uint8_t)br);
@@ -1268,7 +1339,7 @@ void renderRadar() {
   String rs = active ? String(best) + "dBm" : String("SWEEP");
   boldText(g, 228 - (int)rs.length() * 12, 252, rs, themeColor(active ? rssiColor(best) : C_MUTED), 2, 1);
 
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 void renderUI() {
@@ -1281,20 +1352,68 @@ void renderUI() {
   else renderPage();
 }
 
+// Draws the current screen fully visible (no intro fade). Used for "Scanning..." / "Connecting..."
+// status screens that are shown right before a blocking operation, so they never appear blank.
+void renderUIStatic() {
+  float saved = introP;
+  introP = 1.0f;
+  renderUI();
+  introP = saved;
+}
+
+// ---------------- animation engine ----------------
+// * critically damped spring for list scrolling (no stepping, no overshoot, follows direction changes smoothly)
+// * time based (dt), so the speed is identical no matter how long a frame takes
+// * intro cascade whenever a page / sub menu / detail view opens
 void animateUI() {
   unsigned long now = millis();
-  if (now - lastFrame < 25) return;
+  if (now - lastFrame < FRAME_MS) return;
+
+  float dt = (float)(now - lastAnimMs) / 1000.0f;
+  lastAnimMs = now;
+  if (dt < 0.001f) dt = 0.001f;
+  if (dt > 0.05f) dt = 0.05f;
+
+  // detect a view change (page, sub menu, password screen, detail view) and restart the intro
+  static uint32_t lastViewKey = 0xFFFFFFFF;
+  uint32_t viewKey = (uint32_t)page * 10000u + (uint32_t)(subView & 15) * 1000u +
+                     (uint32_t)(apStage & 3) * 100u + (wifiDetailView ? 10u : 0u) + (bleDetailView ? 20u : 0u) +
+                     (qrShowing ? 40u : 0u);
+  if (viewKey != lastViewKey) {
+    lastViewKey = viewKey;
+    introP = 0.0f;
+  }
+
   float target = (page == MENU) ? (float)selected : (float)pageSel;
   float diff = target - scrollPos;
-  if (fabsf(diff) > 0.004f) {
-    scrollPos += diff * 0.38f;
-    if (fabsf(target - scrollPos) < 0.01f) scrollPos = target;
+
+  if (fabsf(diff) > 0.002f || fabsf(scrollVel) > 0.01f) {
+    const float K = SCROLL_K;
+    const float C = 2.0f * sqrtf(K);               // critical damping
+    int steps = (int)(dt / 0.006f) + 1;
+    float h = dt / (float)steps;
+    for (int i = 0; i < steps; i++) {
+      float acc = (target - scrollPos) * K - scrollVel * C;
+      scrollVel += acc * h;
+      scrollPos += scrollVel * h;
+    }
+    if (fabsf(target - scrollPos) < 0.002f && fabsf(scrollVel) < 0.02f) {
+      scrollPos = target;
+      scrollVel = 0.0f;
+    }
     uiDirty = true;
   }
+
+  if (introP < 1.0f) {
+    introP += dt / INTRO_SECS;
+    if (introP > 1.0f) introP = 1.0f;
+    uiDirty = true;
+  }
+
   if (radarActive()) uiDirty = true;            // radar sweep animates continuously
   if (uiDirty) {
     uiDirty = false;
-    lastFrame = now;
+    lastFrame = millis();
     renderUI();
   }
 }
@@ -1415,6 +1534,7 @@ void apConnect(const String &ssid, const String &pass) {
   apStage = 2;
   pageSel = 0;
   scrollPos = 0.0f;
+  scrollVel = 0.0f;
 }
 
 void apFail(const char *msg) {
@@ -1433,6 +1553,7 @@ void apCancel() {
   apStage = 0;
   pageSel = apListSel;
   scrollPos = (float)pageSel;
+  scrollVel = 0.0f;
 }
 
 void apDisconnect(bool forget) {
@@ -1486,7 +1607,7 @@ void apTestInternet() {
   apNetMsg = "Testing...";
   buildWifi();
   uiDirty = false;
-  renderUI();
+  renderUIStatic();
 
   WiFiClient client;
   HTTPClient http;
@@ -1632,6 +1753,7 @@ void wifiKbBack() {
   apStage = 0;
   pageSel = apListSel;
   scrollPos = (float)pageSel;
+  scrollVel = 0.0f;
   buildWifi();
 }
 
@@ -1650,6 +1772,7 @@ void apListClick() {
     apStage = 2;
     pageSel = 0;
     scrollPos = 0.0f;
+    scrollVel = 0.0f;
     return;
   }
   int k = pageSel - 1 - (apIdxCount == 0 ? 1 : 0);  // first row is the status, then (maybe) a "Scanning" row
@@ -1669,6 +1792,7 @@ void apListClick() {
       apStage = 1;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
       kbOpen();
     }
   } else {
@@ -1692,6 +1816,7 @@ void apStatusClick() {
       apStage = 0;
       pageSel = apListSel;
       scrollPos = (float)pageSel;
+      scrollVel = 0.0f;
     }
   } else if (v == 3) {
     if (act == 0) {
@@ -1702,6 +1827,7 @@ void apStatusClick() {
       apStage = 1;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
       kbOpen();
     }
   }
@@ -1711,6 +1837,7 @@ void wifiEnterView(int v) {
   subView = v;
   pageSel = 0;
   scrollPos = 0.0f;
+  scrollVel = 0.0f;
   wifiDetailView = false;
   apStage = 0;
   if (v == 1 || v == 2) startWiFiScan();
@@ -1730,6 +1857,7 @@ void wifiClick() {
         wifiDetailView = true;
         pageSel = 0;
         scrollPos = 0.0f;
+        scrollVel = 0.0f;
       } else {
         startWiFiScan();
       }
@@ -1749,6 +1877,7 @@ void wifiBack() {
     wifiDetailView = false;
     pageSel = wifiSelectedIndex;
     scrollPos = (float)pageSel;
+    scrollVel = 0.0f;
     buildWifi();
     return;
   }
@@ -1757,6 +1886,7 @@ void wifiBack() {
     apStage = 0;
     pageSel = apListSel;
     scrollPos = (float)pageSel;
+    scrollVel = 0.0f;
     buildWifi();
     return;
   }
@@ -1766,6 +1896,7 @@ void wifiBack() {
   apStage = 0;
   pageSel = subParentSel;
   scrollPos = (float)pageSel;
+  scrollVel = 0.0f;
   buildWifi();
 }
 
@@ -2223,6 +2354,9 @@ void buildNRF24() {
   finishLines();
 }
 
+// NRF24 spectrum bars glide to their new values instead of snapping
+float nrfShown[84] = {};
+
 void renderNRFSpectrum() {
   Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
   g->fillScreen(bgColor());
@@ -2251,16 +2385,26 @@ void renderNRFSpectrum() {
       g->print(level);
     }
 
+    bool moving = false;
     for (uint8_t channel = 0; channel < 84; channel++) {
+      float goal = (float)nrf24Activity[channel];
+      float diff = goal - nrfShown[channel];
+      if (fabsf(diff) > 0.5f) {
+        nrfShown[channel] += diff * 0.28f;
+        moving = true;
+      } else {
+        nrfShown[channel] = goal;
+      }
       int x0 = graphLeft + (graphRight - graphLeft) * channel / 84;
       int x1 = graphLeft + (graphRight - graphLeft) * (channel + 1) / 84;
-      int barHeight = graphHeight * nrf24Activity[channel] / 100;
-      if (barHeight == 0) continue;
-      uint16_t color = nrf24Activity[channel] >= 75 ? C_RED :
-                       (nrf24Activity[channel] >= 25 ? C_YELLOW : C_GREEN);
+      int barHeight = (int)(graphHeight * nrfShown[channel] / 100.0f);
+      if (barHeight <= 0) continue;
+      uint16_t color = nrfShown[channel] >= 75 ? C_RED :
+                       (nrfShown[channel] >= 25 ? C_YELLOW : C_GREEN);
       g->fillRect(x0, graphBottom - barHeight, max(1, x1 - x0), barHeight,
                   themeColor(color));
     }
+    if (moving) uiDirty = true;                    // keep animating until the bars settle
 
     g->setTextSize(1);
     g->setTextColor(themeColor(C_WHITE));
@@ -2270,7 +2414,7 @@ void renderNRFSpectrum() {
     g->print("2483 MHz");
   }
 
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 void buildLoRa();
@@ -2377,6 +2521,9 @@ static const char *KB_ROWS[3][3] = {
 
 int kbRowLen(int r) { return r == 3 ? 6 : (int)strlen(KB_ROWS[kbMode][r]); }
 
+// The key highlight glides between keys (smooth cursor)
+float kbCurX = -1.0f, kbCurY = -1.0f;
+
 void kbMove(int dx, int dy) {
   int len = kbRowLen(kbRow);
   if (dx != 0) {
@@ -2397,6 +2544,7 @@ void kbOpen() {
   kbMode = 0;
   kbRow = 0;
   kbCol = 0;
+  kbCurX = -1.0f;
   chatStatus = "";
 }
 
@@ -2482,7 +2630,8 @@ void renderKeyboard() {
     for (unsigned int i = 0; i + 1 < buf.length(); i++) shown += '*';
     if (buf.length()) shown += buf[buf.length() - 1];
   }
-  String t = shown + "_";
+  // blinking text cursor
+  String t = shown + (((millis() / 500) & 1) ? " " : "_");
   const int per = 17;
   int total = ((int)t.length() + per - 1) / per;
   int first = total > 4 ? total - 4 : 0;
@@ -2508,6 +2657,33 @@ void renderKeyboard() {
   const uint16_t specColor[6] = {fg, fg, themeColor(C_RED), themeColor(C_GREEN),
                                  w ? themeColor(C_CYAN) : themeColor(C_YELLOW), themeColor(C_RED)};
 
+  // geometry of the selected key (used for the gliding highlight)
+  int selN = kbRowLen(kbRow);
+  int selStep = (kbRow == 3) ? 38 : 22;
+  float selX = (float)((240 - selN * selStep) / 2 + 1 + kbCol * selStep);
+  float selY = (float)(124 + kbRow * 30);
+  float selW = (float)(selStep - 2);
+  if (kbCurX < 0.0f) { kbCurX = selX; kbCurY = selY; }
+  kbCurX += (selX - kbCurX) * 0.45f;
+  kbCurY += (selY - kbCurY) * 0.45f;
+  bool kbMoving = fabsf(selX - kbCurX) > 0.6f || fabsf(selY - kbCurY) > 0.6f;
+  if (!kbMoving) { kbCurX = selX; kbCurY = selY; }
+
+  for (int r = 0; r < 4; r++) {
+    int n = kbRowLen(r);
+    int step = (r == 3) ? 38 : 22;
+    int kw = step - 2;
+    int x0 = (240 - n * step) / 2 + 1;
+    int y = 124 + r * 30;
+    for (int c = 0; c < n; c++) {
+      int x = x0 + c * step;
+      g->fillRoundRect(x, y, kw, 26, 4, keyBg);
+    }
+  }
+
+  // gliding highlight
+  g->fillRoundRect((int)lroundf(kbCurX), (int)lroundf(kbCurY), (int)selW, 26, 4, accent);
+
   for (int r = 0; r < 4; r++) {
     int n = kbRowLen(r);
     int step = (r == 3) ? 38 : 22;
@@ -2517,7 +2693,6 @@ void renderKeyboard() {
     for (int c = 0; c < n; c++) {
       int x = x0 + c * step;
       bool sel = (r == kbRow && c == kbCol);
-      g->fillRoundRect(x, y, kw, 26, 4, sel ? accent : keyBg);
       if (r < 3) {
         char ch[2] = {KB_ROWS[kbMode][r][c], 0};
         g->setTextSize(2);
@@ -2534,7 +2709,8 @@ void renderKeyboard() {
     }
   }
 
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  uiDirty = true;                                  // keeps the cursor blink + glide running
+  flushCanvas();
 }
 
 // ---------- screens ----------
@@ -2616,6 +2792,7 @@ void loraBack() {
     pageSel = subParentSel;
   }
   scrollPos = (float)pageSel;
+  scrollVel = 0.0f;
   buildLoRa();
 }
 
@@ -2623,6 +2800,7 @@ void loraEnterView(int v) {
   subView = v;
   pageSel = 0;
   scrollPos = 0.0f;
+  scrollVel = 0.0f;
   if (v == 3) loraSavedLoad();
   if (v == 4) kbOpen();
   if (v == 5) loraUnread = 0;
@@ -2660,6 +2838,7 @@ void loraClick() {
       loraUnread = 0;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
     }
   }
   buildLoRa();
@@ -2902,7 +3081,7 @@ void qrNetStart(bool forceAP) {
   qrNetMsg = forceAP ? "Starting hotspot..." : "Connecting Wi-Fi...";
   buildQR();
   uiDirty = false;
-  renderUI();
+  renderUIStatic();
 
   bool ok = false;
   if (!forceAP) {
@@ -3070,7 +3249,7 @@ void renderQR() {
   g->setCursor(max(2, (240 - (int)title.length() * 6) / 2), 262);
   g->print(title);
 
-  if (canvasReady) lcd.drawRGBBitmap(0, 0, canvas->getBuffer(), 240, 280);
+  flushCanvas();
 }
 
 // ---- navigation ----
@@ -3085,6 +3264,7 @@ void qrBack() {
   subView = 0;
   pageSel = subParentSel;
   scrollPos = (float)pageSel;
+  scrollVel = 0.0f;
   buildQR();
 }
 
@@ -3097,10 +3277,12 @@ void qrClick() {
       subView = pageSel + 1;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
       if (subView == 2) {
         qrNetStart(false);
         pageSel = 0;
         scrollPos = 0.0f;
+        scrollVel = 0.0f;
       }
     }
   } else if (subView == 1) {
@@ -3118,11 +3300,13 @@ void qrClick() {
       qrNetStart(!qrAP);
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
     } else if (act == 2) {
       qrCustomText = "";
       qrSaveText();
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
     }
   }
   buildQR();
@@ -3510,7 +3694,7 @@ void fetchWeather() {
   wxState = 1;
   buildWeather();
   uiDirty = false;
-  renderUI();
+  renderUIStatic();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiBegin()) {                               // only if a network was saved before
@@ -3613,7 +3797,7 @@ void fetchPlace() {
   placeState = 1;
   buildGPS();
   uiDirty = false;
-  renderUI();
+  renderUIStatic();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiBegin()) {                               // only if a network was saved before
@@ -3804,6 +3988,8 @@ void enterPage(Page p) {
   lastDraw = 0;
   pageSel = 0;
   scrollPos = 0.0f;
+  scrollVel = 0.0f;
+  introP = 0.0f;                  // cascade-in animation for the new page
   lastClockSec = -1;
   subView = 0;
   qrShowing = false;
@@ -3822,7 +4008,7 @@ void enterPage(Page p) {
       startLines();
       addLine("Scanning...", "", C_YELLOW, C_YELLOW);
       finishLines();
-      renderUI();
+      renderUIStatic();
       startBLEScan();
       buildBleList();
       break;
@@ -3837,6 +4023,8 @@ void enterPage(Page p) {
     case CONFIG_PAGE: buildConfig(); break;
     case FACE_PAGE: startLines(); lastFaceKey = 0xFFFFFFFF; break;
   }
+  introP = 0.0f;                  // restart after any blocking work (scan / fetch) so the intro is actually seen
+  lastAnimMs = millis();
   if (page != MENU) { uiDirty = false; renderUI(); }
   lastDraw = millis();
 }
@@ -3891,11 +4079,12 @@ void saveSettings() {
   prefs.end();
 }
 
+// Backlight changes go through backlightUpdate(), which fades smoothly
 void markActivity() {
   lastActivity = millis();
   if (dimmed) {
     dimmed = false;
-    analogWrite(LCD_BL, screenBrightness);
+    blTarget = screenBrightness;
   }
 }
 
@@ -3903,7 +4092,7 @@ void dimUpdate() {
   if (dimIdx == 0 || dimmed) return;
   if (millis() - lastActivity > (unsigned long)DIM_SECS[dimIdx] * 1000UL) {
     dimmed = true;
-    analogWrite(LCD_BL, DIM_LEVEL);
+    blTarget = DIM_LEVEL;
   }
 }
 
@@ -3913,6 +4102,7 @@ void gpsClick() {
     subView = (pageSel == 0) ? 1 : 2;
     pageSel = 0;
     scrollPos = 0.0f;
+    scrollVel = 0.0f;
   } else if (subView == 1) {
     fetchPlace();
   } else {
@@ -3931,6 +4121,7 @@ void irClick() {
       subView = pageSel + 1;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
       if (subView == 1) {
         irMessage = irCaptured ? "Captured" : "Listening...";
         irStart();                 // receiver only runs inside IR Capture
@@ -3986,6 +4177,7 @@ void nrf24Click() {
     subView = pageSel + 1;
     pageSel = 0;
     scrollPos = 0.0f;
+    scrollVel = 0.0f;
   } else if (subView == 1) {
     nrf24Ready = nrf24.isChipConnected();
   }
@@ -3999,13 +4191,14 @@ void configClick() {
       subView = pageSel + 1;
       pageSel = 0;
       scrollPos = 0.0f;
+      scrollVel = 0.0f;
     }
   } else if (subView == 1) {
     switch (pageSel) {
       case 0:
         configSelection = (configSelection + 1) % BRIGHT_COUNT;
         screenBrightness = brightLevels[configSelection];
-        analogWrite(LCD_BL, screenBrightness);
+        blTarget = screenBrightness;               // fades to the new level
         break;
       case 1:
         oriIdx = (oriIdx + 1) % 2;
@@ -4043,6 +4236,7 @@ void singleClick() {
           bleDetailView = true;
           pageSel = 0;
           scrollPos = 0.0f;
+          scrollVel = 0.0f;
           buildBleDetail();
         } else {
           startLines();
@@ -4050,7 +4244,8 @@ void singleClick() {
           finishLines();
           pageSel = 0;
           scrollPos = 0.0f;
-          renderUI();
+          scrollVel = 0.0f;
+          renderUIStatic();
           startBLEScan();
           buildBleList();
         }
@@ -4227,11 +4422,13 @@ void pollJoystick() {
       subView = 0;
       pageSel = subParentSel;
       scrollPos = (float)pageSel;
+      scrollVel = 0.0f;
       buildNRF24();
     } else if ((page == GPS_PAGE || page == CONFIG_PAGE || page == IR_PAGE) && subView != 0) {
       subView = 0;
       pageSel = subParentSel;
       scrollPos = (float)pageSel;
+      scrollVel = 0.0f;
       if (page == GPS_PAGE) buildGPS();
       else if (page == IR_PAGE) { irStop(); buildIR(); }
       else buildConfig();
@@ -4239,6 +4436,7 @@ void pollJoystick() {
       bleDetailView = false;
       pageSel = bleSelectedIndex;
       scrollPos = (float)pageSel;
+      scrollVel = 0.0f;
       buildBleList();
     } else {
       goBackToMenu();
@@ -4320,7 +4518,9 @@ void setup() {
 
   pinMode(JOY_SW, INPUT_PULLUP);
   pinMode(LCD_BL, OUTPUT);
-  analogWrite(LCD_BL, screenBrightness);
+  blCur = 0.0f;                                   // start dark, then fade the backlight in
+  blTarget = screenBrightness;
+  analogWrite(LCD_BL, 0);
 
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
@@ -4339,7 +4539,7 @@ void setup() {
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
   lcd.init(240, 280);
   lcd.setRotation(oriIdx == 0 ? 2 : 0);
-  lcd.setSPISpeed(40000000);
+  lcd.setSPISpeed(LCD_SPI_HZ);
   lcd.fillScreen(ST77XX_BLACK);
 
   canvas = new GFXcanvas16(240, 280);
@@ -4357,6 +4557,7 @@ void setup() {
 
   Serial.println("ESP32-S3 WATCHOUT MULTI-TESTER READY");
   lastActivity = millis();
+  lastAnimMs = millis();
   enterPage(MENU);
 }
 
@@ -4368,6 +4569,7 @@ void loop() {
   syncTimeFromGPS();
   pollJoystick();
   animateUI();
+  backlightUpdate();
   ledUpdate();
   pollWeather();
   pollWiFi();
@@ -4397,8 +4599,6 @@ void loop() {
     }
   }
 }
-
-
 /*git add -A
 git commit -m "Update project files and changes"
 git push*/

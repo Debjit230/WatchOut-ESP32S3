@@ -2,8 +2,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
-#include <BLEDevice.h>
-#include <BLEScan.h>
+#include <NimBLEDevice.h>
 #include <LoRa.h>
 #include <RF24.h>
 #include <TinyGPSPlus.h>
@@ -71,7 +70,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define NRF_RELEASE      0.22f       // how fast a bar falls (0..1 per sweep)
 #define NRF_PEAK_DECAY   0.7f        // peak-hold marker fall speed (percent per sweep)
 
-#define FW_VERSION "v2.2"
+#define FW_VERSION "v2.3"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -105,7 +104,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 Adafruit_ST7789 lcd(&SPI, LCD_CS, LCD_DC, LCD_RST);
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
-BLEScan *bleScan = nullptr;
+// (Bluetooth is handled by the NimBLE block below)
 RF24 nrf24(NRF24_CE, NRF24_CSN);
 bool nrf24Ready = false;
 bool nrf24Scanned = false;           // true once the first full sweep has finished
@@ -1940,41 +1939,250 @@ bool wifiLongClick() {
   return false;
 }
 
-void startBLEScan() {
-  if (!bleScan) {
-    BLEDevice::init("");
-    bleScan = BLEDevice::getScan();
-    bleScan->setActiveScan(true);
-    bleScan->setInterval(100);
-    bleScan->setWindow(80);
-  }
-  bleStarted = true;
-  BLEScanResults *results = bleScan->start(2, false);
-  if (results != nullptr) {
-    int n = results->getCount();
-    for (int i = 0; i < n; i++) {
-      BLEAdvertisedDevice d = results->getDevice(i);
-      String mac = String(d.getAddress().toString().c_str());
-      String name = d.haveName() ? String(d.getName().c_str()) : String("Unknown device");
-      int rssi = d.getRSSI();
-      bool found = false;
+// ======================= BLE (NimBLE) =======================
+// Bluetooth sub views:
+//   0 menu | 1 scan | 2 Media Cmd
+// Requires NimBLE-Arduino 2.x (Library Manager: "NimBLE-Arduino" by h2zero).
+//
+// Media Cmd = BLE HID "Consumer Control" remote (play/pause, volume, next/prev, mute, stop,
+// camera shutter). What changed compared with v2.2:
+//   * action rows are tracked dynamically (bleRowAct[]) - the old hard-coded row numbers
+//     pointed at the wrong lines because the hint/status text wraps over a variable number of rows
+//   * HID report is now 1 byte (report ID lives in the Report Reference descriptor, not in the payload)
+//   * bonding / encrypted characteristics + Device Information (PnP ID) service, so Android, iOS and
+//     Windows actually accept the device as a HID remote
+//   * advertising now carries the HID service UUID + appearance (the old clearData() removed them)
+//   * non-blocking key release (no delay() in the UI loop), subscribe-aware link status,
+//     disconnect on stop, Stop / Unpair rows, auto re-advertise after disconnect
 
-      for (int j = 0; j < bleCount; j++) {
-        if (bleList[j].mac == mac) {
-          bleList[j].name = name;
-          bleList[j].rssi = rssi;
-          bleList[j].lastSeen = millis();
-          found = true;
-          break;
-        }
-      }
-      if (!found && bleCount < MAX_BLE_ENTRIES) {
-        bleList[bleCount] = {name, mac, rssi, millis()};
-        bleCount++;
+NimBLEAdvertising *bleAdv = nullptr;
+bool bleNimReady = false;
+bool bleScanBusy = false;
+
+// ---- media cmd (BLE HID) ----
+NimBLEServer *bleServer = nullptr;
+NimBLEService *bleHidSvc = nullptr;
+NimBLECharacteristic *bleMediaReport = nullptr;
+bool bleHidOn = false;
+volatile bool bleHidConnected = false;       // a phone / PC is connected
+volatile bool bleHidReady = false;           // ...and it subscribed to the report (keys will really arrive)
+volatile uint16_t bleConnHandle = 0xFFFF;
+String bleHidMsg = "";
+bool bleKeyPending = false;                  // a key is held, release is sent from pollBle()
+unsigned long bleKeyReleaseAt = 0;
+int bleFirstKeyRow = -1;
+
+const char *BLE_MENU_ITEMS[] = {"BLE Scan", "Media Cmd"};
+const int BLE_MENU_COUNT = 2;
+
+// Action codes for the Media Cmd rows
+#define BLE_ACT_NONE    0
+#define BLE_ACT_STOP    1
+#define BLE_ACT_START   2
+#define BLE_ACT_UNPAIR  3
+#define BLE_ACT_KEY     0x100                // BLE_ACT_KEY | consumer-control bit
+int bleRowAct[MAX_LINES];
+
+// Consumer control bits (match HID_REPORT_MAP below)
+#define HID_VOL_UP     0x01
+#define HID_VOL_DOWN   0x02
+#define HID_MUTE       0x04
+#define HID_PLAY_PAUSE 0x08
+#define HID_NEXT       0x10
+#define HID_PREV       0x20
+#define HID_STOP       0x40
+#define HID_EJECT      0x80
+
+bool bleEnsureInit() {
+  if (bleNimReady && bleAdv) return true;
+  NimBLEDevice::init("WatchOut Remote");
+  NimBLEDevice::setSecurityAuth(true, false, true);                 // bonding, no MITM, secure connections
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);        // "just works" pairing
+  bleAdv = NimBLEDevice::getAdvertising();
+  if (!bleAdv) return false;
+  bleAdv->setMinInterval(160);
+  bleAdv->setMaxInterval(160);
+  bleNimReady = true;
+  return true;
+}
+
+void bleAdvStopNow() {
+  if (bleAdv && bleAdv->isAdvertising()) bleAdv->stop();
+}
+
+class BleServerCb : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *, NimBLEConnInfo &info) override {
+    bleConnHandle = info.getConnHandle();
+    bleHidConnected = true;
+  }
+  void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
+    bleHidConnected = false;
+    bleHidReady = false;
+    bleConnHandle = 0xFFFF;
+  }
+};
+static BleServerCb bleSrvCb;
+
+class BleReportCb : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic *, NimBLEConnInfo &, uint16_t subValue) override {
+    bleHidReady = (subValue & 1) != 0;              // bit0 = notifications enabled
+  }
+};
+static BleReportCb bleRepCb;
+
+// Stop BLE HID: stop advertising and drop the connection
+void bleStopTx() {
+  bleHidOn = false;
+  bleKeyPending = false;
+  bleAdvStopNow();
+  if (bleServer && bleHidConnected) bleServer->disconnect(bleConnHandle);
+  bleHidConnected = false;
+  bleHidReady = false;
+}
+
+void bleStopAll() {
+  if (!bleNimReady) return;
+  bleStopTx();
+}
+
+// ---------------- Media Cmd (BLE HID remote) ----------------
+// Consumer control report (1 byte, Report ID 1):
+//   bit0 Vol+  bit1 Vol-  bit2 Mute  bit3 Play/Pause  bit4 Next  bit5 Prev  bit6 Stop  bit7 Eject
+static const uint8_t HID_REPORT_MAP[] = {
+  0x05, 0x0C,       // Usage Page (Consumer)
+  0x09, 0x01,       // Usage (Consumer Control)
+  0xA1, 0x01,       // Collection (Application)
+  0x85, 0x01,       //   Report ID 1
+  0x15, 0x00,       //   Logical Min 0
+  0x25, 0x01,       //   Logical Max 1
+  0x75, 0x01,       //   Report Size 1
+  0x95, 0x08,       //   Report Count 8
+  0x09, 0xE9,       //   Volume Up
+  0x09, 0xEA,       //   Volume Down
+  0x09, 0xE2,       //   Mute
+  0x09, 0xCD,       //   Play/Pause
+  0x09, 0xB5,       //   Scan Next
+  0x09, 0xB6,       //   Scan Previous
+  0x09, 0xB7,       //   Stop
+  0x09, 0xB8,       //   Eject
+  0x81, 0x02,       //   Input (Data, Variable, Absolute)
+  0xC0              // End Collection
+};
+
+// Sends one 1-byte HID report (report ID is added by the stack through the Report Reference descriptor)
+bool bleMediaSend(uint8_t bits) {
+  if (!bleMediaReport || !bleHidConnected) return false;
+  bleMediaReport->setValue(&bits, 1);
+  return bleMediaReport->notify();
+}
+
+// Press now, release is sent ~60 ms later by pollBle() (no blocking delay)
+void bleMediaKey(uint8_t bit, const char *name) {
+  if (!bleHidConnected) { bleHidMsg = "Not connected"; return; }
+  if (bleKeyPending) { bleMediaSend(0); bleKeyPending = false; }   // release the previous key first
+  if (bleMediaSend(bit)) {
+    bleKeyPending = true;
+    bleKeyReleaseAt = millis() + 60;
+    bleHidMsg = String("Sent ") + name;
+    ledFlash(88, 86, 214, 120);
+  } else {
+    bleHidMsg = bleHidReady ? "Send failed" : "Not paired yet";
+  }
+}
+
+void bleMediaStart() {
+  bleStopTx();
+  if (!bleEnsureInit()) { bleHidMsg = "BLE init failed"; return; }
+  if (!bleServer) {
+    bleServer = NimBLEDevice::createServer();
+    bleServer->setCallbacks(&bleSrvCb);
+  }
+  if (!bleMediaReport) {
+    // --- HID service ---
+    bleHidSvc = bleServer->createService("1812");
+    NimBLECharacteristic *proto = bleHidSvc->createCharacteristic("2A4E", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE_NR);
+    uint8_t z = 1;                                                // 1 = report protocol
+    proto->setValue(&z, 1);
+    NimBLECharacteristic *info = bleHidSvc->createCharacteristic("2A4A", NIMBLE_PROPERTY::READ);
+    uint8_t hi[4] = {0x11, 0x01, 0x00, 0x02};                     // HID v1.11, country 0, flags: normally connectable
+    info->setValue(hi, 4);
+    bleHidSvc->createCharacteristic("2A4C", NIMBLE_PROPERTY::WRITE_NR);   // control point
+    NimBLECharacteristic *rmap = bleHidSvc->createCharacteristic("2A4B", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC);
+    rmap->setValue(HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
+    bleMediaReport = bleHidSvc->createCharacteristic("2A4D",
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
+    uint8_t zero = 0;
+    bleMediaReport->setValue(&zero, 1);
+    bleMediaReport->setCallbacks(&bleRepCb);
+    uint8_t rr[2] = {1, 0x01};                                    // report ID 1, type 1 = input
+    NimBLEDescriptor *rd = bleMediaReport->createDescriptor("2908", NIMBLE_PROPERTY::READ);
+    rd->setValue(rr, 2);
+
+    // --- Device Information (PnP ID is required by several hosts) ---
+    NimBLEService *dis = bleServer->createService("180A");
+    NimBLECharacteristic *man = dis->createCharacteristic("2A29", NIMBLE_PROPERTY::READ);
+    man->setValue("WatchOut");
+    NimBLECharacteristic *pnp = dis->createCharacteristic("2A50", NIMBLE_PROPERTY::READ);
+    uint8_t pid[7] = {0x02, 0xE5, 0x02, 0xA1, 0x11, 0x10, 0x02};  // USB vendor source, VID 0x02E5, PID 0x11A1, v2.10
+    pnp->setValue(pid, 7);
+
+    // --- Battery ---
+    NimBLEService *bat = bleServer->createService("180F");
+    NimBLECharacteristic *bl = bat->createCharacteristic("2A19", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    uint8_t bv = 100;
+    bl->setValue(&bv, 1);
+    // NimBLE 2.x: services are started automatically when the server/advertising starts
+  }
+
+  bleAdvStopNow();
+  bleAdv->clearData();
+  bleAdv->setName("WatchOut Remote");
+  bleAdv->addServiceUUID(bleHidSvc->getUUID());     // phones filter HID devices by this UUID
+  bleAdv->setAppearance(0x03C0);                    // generic HID
+  bool ok = bleAdv->start();
+  bleHidOn = ok;
+  bleHidMsg = ok ? "Pair WatchOut Remote" : "Advertise failed";
+}
+
+// ---------------- BLE scan (NimBLE) ----------------
+void startBLEScan() {
+  if (!bleEnsureInit()) {
+    startLines();
+    addLine("BLE init failed", "", C_RED, C_RED);
+    finishLines();
+    return;
+  }
+  bleScanBusy = true;
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(80);
+  NimBLEScanResults res = scan->getResults(2000, false);          // blocking 2 s scan
+  int n = res.getCount();
+  for (int i = 0; i < n; i++) {
+    const NimBLEAdvertisedDevice *d = res.getDevice((uint32_t)i);
+    if (!d) continue;
+    String mac = String(d->getAddress().toString().c_str());
+    mac.toUpperCase();
+    String name = d->getName().length() ? String(d->getName().c_str()) : String("Unknown device");
+    int rssi = d->getRSSI();
+    bool found = false;
+    for (int j = 0; j < bleCount; j++) {
+      if (bleList[j].mac == mac) {
+        bleList[j].name = name;
+        bleList[j].rssi = rssi;
+        bleList[j].lastSeen = millis();
+        found = true;
+        break;
       }
     }
+    if (!found && bleCount < MAX_BLE_ENTRIES) {
+      bleList[bleCount] = {name, mac, rssi, millis()};
+      bleCount++;
+    }
   }
-  bleScan->clearResults();
+  scan->clearResults();
+  bleScanBusy = false;
   bleStarted = false;
 
   for (int i = 0; i < bleCount; i++) {
@@ -2010,6 +2218,195 @@ void buildBleDetail() {
   addKV("Signal", String(getSignalQuality(d.rssi)) + "%", rssiColor(d.rssi));
   addKV("Seen", String((millis() - d.lastSeen) / 1000) + "s ago", C_WHITE);
   finishLines();
+}
+
+void bleDoScan() {
+  startLines();
+  addLine("Scanning...", "", C_YELLOW, C_YELLOW);
+  finishLines();
+  pageSel = 0;
+  scrollPos = 0.0f;
+  scrollVel = 0.0f;
+  renderUIStatic();
+  bleStarted = true;
+  startBLEScan();
+  buildBleList();
+}
+
+String bleSysStatus() {
+  if (bleHidConnected) return "HID LINK";
+  if (bleHidOn) return "HID ADV";
+  return "READY";
+}
+
+// Adds one Media Cmd row and remembers what a click on it does
+static void bleAddActRow(int act, const char *label, uint16_t col, const char *right = "") {
+  if (lineCount >= MAX_LINES) return;
+  bleRowAct[lineCount] = act;
+  if ((act & BLE_ACT_KEY) && bleFirstKeyRow < 0) bleFirstKeyRow = lineCount;
+  addLine(label, right, col, col);
+}
+
+void buildBle() {
+  startLines();
+  for (int i = 0; i < MAX_LINES; i++) bleRowAct[i] = BLE_ACT_NONE;
+  bleFirstKeyRow = -1;
+
+  switch (subView) {
+    case 1:
+      if (bleDetailView) buildBleDetail();
+      else buildBleList();
+      return;                                     // these builders call finishLines() themselves
+    case 2: {
+      const char *st = !bleHidOn ? "OFF" : (bleHidReady ? "LINK" : (bleHidConnected ? "PAIR" : "ADV"));
+      uint16_t sc = bleHidReady ? C_GREEN : (bleHidOn ? C_YELLOW : C_RED);
+      bleRowAct[lineCount] = bleHidOn ? BLE_ACT_STOP : BLE_ACT_START;   // click on the status row toggles
+      addLine("HID", st, C_WHITE, sc);
+      if (bleHidOn) {
+        if (!bleHidConnected) addWrapped("Pair 'WatchOut Remote' in BT settings", C_MUTED);
+        if (bleHidMsg.length()) addWrapped(bleHidMsg, C_CYAN);
+        bleAddActRow(BLE_ACT_KEY | HID_PLAY_PAUSE, "Play / Pause", C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_VOL_UP,     "Volume +",     C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_VOL_DOWN,   "Volume -",     C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_NEXT,       "Next Track",   C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_PREV,       "Prev Track",   C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_MUTE,       "Mute",         C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_STOP,       "Stop Media",   C_WHITE);
+        bleAddActRow(BLE_ACT_KEY | HID_VOL_UP,     "Camera Shutter", C_WHITE);
+        bleAddActRow(BLE_ACT_UNPAIR,               "> Unpair all", C_YELLOW);
+        bleAddActRow(BLE_ACT_STOP,                 "> Stop",       C_RED);
+      } else {
+        if (bleHidMsg.length()) addWrapped(bleHidMsg, C_YELLOW);
+        addWrapped("Remote control media + camera shutter over BLE HID", C_MUTED);
+        bleAddActRow(BLE_ACT_START, "> Start", C_GREEN);
+      }
+      break;
+    }
+    default:
+      for (int i = 0; i < BLE_MENU_COUNT; i++) {
+        String st = "";
+        if (i == 1 && bleHidOn) st = bleHidConnected ? "LINK" : "ADV";
+        addLine(BLE_MENU_ITEMS[i], st, C_WHITE, st.length() ? C_GREEN : C_WHITE);
+      }
+      break;
+  }
+  finishLines();
+}
+
+void bleClick() {
+  switch (subView) {
+    case 0:
+      if (pageSel < BLE_MENU_COUNT) {
+        subParentSel = pageSel;
+        subView = pageSel == 0 ? 1 : 2;
+        pageSel = 0;
+        scrollPos = 0.0f;
+        scrollVel = 0.0f;
+        if (subView == 1) {
+          bleDoScan();
+        } else {
+          bleMediaStart();
+          buildBle();
+          if (bleFirstKeyRow > 0) {               // start on the first key instead of the status row
+            pageSel = bleFirstKeyRow;
+            scrollPos = (float)pageSel;
+          }
+        }
+      }
+      break;
+    case 1:
+      if (!bleDetailView) {
+        if (bleCount > 0 && pageSel < bleCount) {
+          bleSelectedIndex = pageSel;
+          bleDetailView = true;
+          pageSel = 0;
+          scrollPos = 0.0f;
+          scrollVel = 0.0f;
+        } else {
+          bleDoScan();
+        }
+      }
+      break;
+    case 2: {
+      int act = (pageSel >= 0 && pageSel < MAX_LINES) ? bleRowAct[pageSel] : BLE_ACT_NONE;
+      if (act & BLE_ACT_KEY) {
+        uint8_t bit = (uint8_t)(act & 0xFF);
+        const char *name = "key";
+        switch (bit) {
+          case HID_PLAY_PAUSE: name = "Play/Pause"; break;
+          case HID_VOL_UP:     name = (lines[pageSel].l == "Camera Shutter") ? "Shutter" : "Vol+"; break;
+          case HID_VOL_DOWN:   name = "Vol-"; break;
+          case HID_NEXT:       name = "Next"; break;
+          case HID_PREV:       name = "Prev"; break;
+          case HID_MUTE:       name = "Mute"; break;
+          case HID_STOP:       name = "Stop"; break;
+        }
+        bleMediaKey(bit, name);
+      } else if (act == BLE_ACT_STOP) {
+        bleStopTx();
+        bleHidMsg = "";
+        pageSel = 0;
+        scrollPos = 0.0f;
+        scrollVel = 0.0f;
+      } else if (act == BLE_ACT_START) {
+        bleMediaStart();
+      } else if (act == BLE_ACT_UNPAIR) {
+        NimBLEDevice::deleteAllBonds();
+        if (bleServer && bleHidConnected) bleServer->disconnect(bleConnHandle);
+        bleHidMsg = "Bonds cleared";
+      }
+      break;
+    }
+  }
+  buildBle();
+}
+
+void bleBack() {
+  if (subView == 1 && bleDetailView) {
+    bleDetailView = false;
+    pageSel = bleSelectedIndex;
+    scrollPos = (float)pageSel;
+    scrollVel = 0.0f;
+    buildBle();
+    return;
+  }
+  if (subView != 0) {
+    bleStopTx();
+    subView = 0;
+    pageSel = subParentSel;
+    scrollPos = (float)pageSel;
+    scrollVel = 0.0f;
+    buildBle();
+  }
+}
+
+void pollBle() {
+  if (!bleNimReady) return;
+  unsigned long now = millis();
+
+  // non-blocking key release
+  if (bleKeyPending && (long)(now - bleKeyReleaseAt) >= 0) {
+    bleMediaSend(0);
+    bleKeyPending = false;
+  }
+
+  // keep advertising while we wait for a phone / PC (advertising stops after a disconnect)
+  if (bleHidOn && !bleHidConnected && bleAdv && !bleAdv->isAdvertising()) {
+    bleAdv->start();
+  }
+
+  // refresh the screen + LED when the link state changes
+  static bool lastConn = false;
+  static bool lastReady = false;
+  bool c = bleHidConnected;
+  bool r = bleHidReady;
+  if (c != lastConn || r != lastReady) {
+    if (r && !lastReady) { ledFlash(0, 255, 0, 300); bleHidMsg = "Linked"; }
+    if (!c && lastConn && bleHidOn) bleHidMsg = "Disconnected";
+    lastConn = c;
+    lastReady = r;
+    if (page == BLE_PAGE) lastDraw = 0;            // rebuild on the next loop pass
+  }
 }
 
 int placeState = 0;
@@ -3236,7 +3633,7 @@ String fakePayload(int i) {
         contact += String("\nTEL;TYPE=CELL:") + QR_OWNER_PHONE;
       return contact + "\nEND:VCARD";
     }
-    case 1: return "https://github.com";
+    case 1: return "https://github.com/Debjit230";
     case 2: return QR_MUSIC_LINK;
     case 3: return "WIFI:T:nopass;S:Free Wi-Fi;;";
     case 4: return "https://www.google.com";
@@ -3802,7 +4199,7 @@ void buildSystem() {
   bool fix = gps.location.isValid() && gps.location.age() < 5000;
   bool uart = gps.charsProcessed() > 0;
   addLine("Wi-Fi", wifiConn ? "CONNECTED" : "READY", C_MUTED, wifiConn ? C_GREEN : C_WHITE);
-  addLine("BLE", bleScan ? "READY" : "IDLE", C_MUTED, bleScan ? C_GREEN : C_WHITE);
+  addLine("BLE", bleSysStatus(), C_MUTED, bleSysStatus() == "READY" ? C_WHITE : C_GREEN);
   addLine("GPS", uart ? "UART OK" : "NO DATA", C_MUTED, uart ? C_GREEN : C_RED);
   addLine("GPS Fix", fix ? "VALID" : "NO FIX", C_MUTED, fix ? C_GREEN : C_YELLOW);
   addLine("Sats", String(gps.satellites.isValid() ? gps.satellites.value() : 0), C_MUTED, C_WHITE);
@@ -4298,12 +4695,8 @@ void enterPage(Page p) {
     case BLE_PAGE:
       bleDetailView = false;
       bleSelectedIndex = 0;
-      startLines();
-      addLine("Scanning...", "", C_YELLOW, C_YELLOW);
-      finishLines();
-      renderUIStatic();
-      startBLEScan();
-      buildBleList();
+      subView = 0;
+      buildBle();
       break;
     case GPS_PAGE: buildGPS(); break;
     case LORA_PAGE: startLoRa(); buildLoRa(); break;
@@ -4530,28 +4923,7 @@ void singleClick() {
   switch (page) {
     case WIFI_PAGE: wifiClick(); break;
 
-    case BLE_PAGE:
-      if (!bleDetailView) {
-        if (pageSel < bleCount) {
-          bleSelectedIndex = pageSel;
-          bleDetailView = true;
-          pageSel = 0;
-          scrollPos = 0.0f;
-          scrollVel = 0.0f;
-          buildBleDetail();
-        } else {
-          startLines();
-          addLine("Scanning...", "", C_YELLOW, C_YELLOW);
-          finishLines();
-          pageSel = 0;
-          scrollPos = 0.0f;
-          scrollVel = 0.0f;
-          renderUIStatic();
-          startBLEScan();
-          buildBleList();
-        }
-      }
-      break;
+    case BLE_PAGE: bleClick(); break;
 
     case GPS_PAGE: gpsClick(); break;
     case LORA_PAGE: loraClick(); break;
@@ -4576,7 +4948,7 @@ void leavePageCleanup() {
     wifiDetailView = false;
     apStage = 0;
   }
-  if (page == BLE_PAGE) bleDetailView = false;
+  if (page == BLE_PAGE) { bleDetailView = false; bleStopAll(); }
   if (page == NRF24_PAGE && nrf24Ready) nrf24.stopListening();
   if (page == IR_PAGE) irStop();
   if (page == QR_PAGE) {
@@ -4733,12 +5105,8 @@ void pollJoystick() {
       if (page == GPS_PAGE) buildGPS();
       else if (page == IR_PAGE) { irStop(); buildIR(); }
       else buildConfig();
-    } else if (page == BLE_PAGE && bleDetailView) {
-      bleDetailView = false;
-      pageSel = bleSelectedIndex;
-      scrollPos = (float)pageSel;
-      scrollVel = 0.0f;
-      buildBleList();
+    } else if (page == BLE_PAGE && subView != 0) {
+      bleBack();
     } else {
       goBackToMenu();
     }
@@ -4877,6 +5245,7 @@ void loop() {
   pollAP();
   pollRadar();
   pollLoRa();
+  pollBle();
   pollNRF24Spectrum();
   trackerPoll();
   qrPoll();
@@ -4886,6 +5255,7 @@ void loop() {
     lastDraw = millis();
     switch (page) {
       case WIFI_PAGE: buildWifi(); break;
+      case BLE_PAGE: buildBle(); break;
       case GPS_PAGE: buildGPS(); break;
       case LORA_PAGE: buildLoRa(); break;
       case NRF24_PAGE: buildNRF24(); break;

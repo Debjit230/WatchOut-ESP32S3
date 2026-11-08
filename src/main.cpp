@@ -66,11 +66,11 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define NRF_SAMPLES      4           // RPD samples per channel per sweep (more = smoother but slower)
 #define NRF_DWELL_US     140         // listen time per sample (the radio needs ~130 us to settle)
 #define NRF_SLICE_US     6000        // max time spent scanning per loop pass (keeps the UI responsive)
-#define NRF_ATTACK       0.65f       // how fast a bar rises (0..1 per sweep)
-#define NRF_RELEASE      0.22f       // how fast a bar falls (0..1 per sweep)
-#define NRF_PEAK_DECAY   0.7f        // peak-hold marker fall speed (percent per sweep)
+#define NRF_ATTACK_MS    60.0f       // time constant when a bar rises
+#define NRF_RELEASE_MS   380.0f      // time constant when a bar falls
+#define NRF_PEAK_FALL    22.0f       // peak marker fall speed, percent per second
 
-#define FW_VERSION "v2.3"
+#define FW_VERSION "v2.5"
 
 // ---------------- PIN MAP ----------------
 #define LCD_MOSI 11
@@ -120,6 +120,8 @@ uint8_t nrfHits[NRF_CH]  = {};       // hits collected by the sweep in progress
 uint8_t nrfWf[NRF_WF_ROWS][NRF_CH];  // waterfall history, newest row at nrfWfHead
 int     nrfWfHead = 0;
 uint8_t nrfScanCh = 0;               // channel the running sweep is on
+uint8_t nrfPass   = 0;               // which of the NRF_SAMPLES passes is running
+int     nrfCursor = -1;              // -1 = off, 0..83 = marker channel
 bool    nrfHold = false;             // long press = freeze the display
 uint8_t nrfView = 0;                 // 0 bars + peak hold, 1 waterfall, 2 Wi-Fi channel load
 uint32_t nrfSweeps = 0;
@@ -2760,8 +2762,11 @@ void startLoRa() {
 
 // ======================= NRF24 SPECTRUM ANALYZER =======================
 // * continuous, non-blocking sweep of all 84 channels (2400..2483 MHz), a few ms per loop pass
-// * several RPD samples per channel, smoothed with fast attack / slow release
+// * INTERLEAVED sampling: NRF_SAMPLES full passes over all channels per sweep, so a short burst
+//   is spread over time instead of being counted 4x or missed 4x
+// * time-based smoothing (attack / release / peak fall are in ms, independent of the sweep rate)
 // * three views (click to cycle): BARS (+ peak hold), FALL (waterfall history), WIFI (load per Wi-Fi channel 1..13)
+// * stick up/down = move a frequency marker (readout shows MHz, activity, peak, Wi-Fi / BLE channel)
 // * long press = HOLD / resume (resume also clears the peak markers)
 // * Wi-Fi channel n is centred on 2407 + 5n MHz, i.e. nRF channel 7 + 5n
 // RPD only reports "signal stronger than -64 dBm on this channel", so the percentage is how often
@@ -2775,6 +2780,7 @@ void startNRF24() {
   if (!nrf24Ready) return;
 
   nrf24.setAutoAck(false);
+  nrf24.disableCRC();
   nrf24.setDataRate(RF24_1MBPS);
   nrf24.setPALevel(RF24_PA_MIN);
   nrf24.setChannel(76);
@@ -2791,6 +2797,8 @@ void nrfSpectrumBegin() {
   memset(nrfWf, 0, sizeof(nrfWf));
   nrfWfHead = 0;
   nrfScanCh = 0;
+  nrfPass = 0;
+  nrfCursor = -1;
   nrfHold = false;
   nrfSweeps = 0;
   nrfSweepRate = 0.0f;
@@ -2803,6 +2811,14 @@ void nrfSpectrumBegin() {
 // A full sweep just finished: update smoothing, peaks, waterfall and the sweep rate
 static void nrfFinishSweep() {
   unsigned long now = millis();
+  static unsigned long lastT = 0;
+  float dt = lastT ? (float)(now - lastT) / 1000.0f : 0.07f;
+  if (dt > 0.5f) dt = 0.5f;
+  lastT = now;
+  const float kA   = 1.0f - expf(-dt * 1000.0f / NRF_ATTACK_MS);
+  const float kR   = 1.0f - expf(-dt * 1000.0f / NRF_RELEASE_MS);
+  const float fall = NRF_PEAK_FALL * dt;
+
   bool pushRow = (now - nrfLastRow >= 80);
   if (pushRow) {
     nrfWfHead = (nrfWfHead + 1) % NRF_WF_ROWS;
@@ -2814,13 +2830,13 @@ static void nrfFinishSweep() {
     nrf24Activity[ch] = (uint8_t)lroundf(inst);
 
     float a = nrfAvg[ch];
-    a += (inst - a) * (inst > a ? NRF_ATTACK : NRF_RELEASE);
+    a += (inst - a) * (inst > a ? kA : kR);
     nrfAvg[ch] = a;
 
     if (a >= nrfPeak[ch]) {
       nrfPeak[ch] = a;
     } else {
-      nrfPeak[ch] -= NRF_PEAK_DECAY;
+      nrfPeak[ch] -= fall;
       if (nrfPeak[ch] < a) nrfPeak[ch] = a;
     }
     if (pushRow) nrfWf[nrfWfHead][ch] = (uint8_t)lroundf(a);
@@ -2843,26 +2859,27 @@ static void nrfFinishSweep() {
   uiDirty = true;
 }
 
-// Scans as many channels as fit into NRF_SLICE_US, then returns so the UI keeps running
+// Scans as many channels as fit into NRF_SLICE_US, then returns so the UI keeps running.
+// One sweep = NRF_SAMPLES passes over all channels; hits accumulate in nrfHits[].
 void scanNRF24Spectrum() {
   if (!nrf24Ready) return;
   unsigned long t0 = micros();
   while (micros() - t0 < (unsigned long)NRF_SLICE_US) {
     uint8_t ch = nrfScanCh;
-    uint8_t hits = 0;
-    for (uint8_t s = 0; s < NRF_SAMPLES; s++) {
-      nrf24.setChannel(ch);
-      nrf24.startListening();
-      delayMicroseconds(NRF_DWELL_US);
-      nrf24.stopListening();
-      if (nrf24.testRPD()) hits++;
-    }
-    nrfHits[ch] = hits;
-    nrfScanCh++;
-    if (nrfScanCh >= NRF_CH) {
+    nrf24.setChannel(ch);
+    nrf24.startListening();
+    delayMicroseconds(NRF_DWELL_US);
+    nrf24.stopListening();
+    if (nrf24.testRPD()) nrfHits[ch]++;            // hits accumulate over the passes
+
+    if (++nrfScanCh >= NRF_CH) {
       nrfScanCh = 0;
-      nrfFinishSweep();
-      break;
+      if (++nrfPass >= NRF_SAMPLES) {
+        nrfPass = 0;
+        nrfFinishSweep();
+        memset(nrfHits, 0, sizeof(nrfHits));       // start the next sweep clean
+        break;
+      }
     }
   }
 }
@@ -2882,6 +2899,33 @@ bool nrfLongClick() {
   ledFlash(255, 159, 10, 200);
   uiDirty = true;
   return true;
+}
+
+// Moves the frequency marker. Moving past the left edge turns it off.
+void nrfMoveCursor(int d) {
+  int c = nrfCursor + d;
+  if (c < -1) c = -1;
+  if (c > NRF_CH - 1) c = NRF_CH - 1;
+  if (nrfCursor < 0 && c >= 0) {                   // first move: start at the strongest channel
+    int pk = 0;
+    for (int i = 1; i < NRF_CH; i++) if (nrfShown[i] > nrfShown[pk]) pk = i;
+    c = pk;
+  }
+  nrfCursor = c;
+  uiDirty = true;
+}
+
+// Readout for the marker: frequency, activity, peak and the matching Wi-Fi / BLE advertising channel
+static String nrfCursorInfo(int c) {
+  String s = String(2400 + c) + "MHz " + String((int)lroundf(nrfShown[c])) + "% pk" +
+             String((int)lroundf(nrfPeak[c]));
+  if (c == 2 || c == 26 || c == 80) {
+    s += " BLE" + String(c == 2 ? 37 : (c == 26 ? 38 : 39));
+  } else {
+    int n = (int)lroundf((c - 7) / 5.0f);
+    if (n >= 1 && n <= 13 && abs(c - (7 + 5 * n)) <= 2) s += " W" + String(n);
+  }
+  return s;
 }
 
 void buildNRF24Info() {
@@ -2939,6 +2983,20 @@ static uint16_t nrfHeat(float v) {
     r = 255; g = 255.0f * (1.0f - k); b = 0;
   }
   return rgb565((uint8_t)r, (uint8_t)g, (uint8_t)b);
+}
+
+// Cached heat colours (101 entries, built once) - avoids float math on every bar / pixel
+static uint16_t heatC(float v) {
+  static uint16_t tab[101];
+  static bool init = false;
+  if (!init) {
+    for (int i = 0; i <= 100; i++) tab[i] = nrfHeat((float)i);
+    init = true;
+  }
+  int i = (int)(v + 0.5f);
+  if (i < 0) i = 0;
+  if (i > 100) i = 100;
+  return tab[i];
 }
 
 // Load of Wi-Fi channel n (1..13) in percent: weighted mean over its 22 MHz width blended with the strongest inner channel
@@ -3016,6 +3074,7 @@ void renderNRFSpectrum() {
   // info lines
   String info;
   if (nrfView == 2) info = "BEST CH " + String(bestWifi + 1) + " (" + String((int)lroundf(wl[bestWifi])) + "% busy)";
+  else if (nrfCursor >= 0) info = nrfCursorInfo(nrfCursor);
   else info = "PEAK " + String(2400 + pk) + " MHz " + String((int)lroundf(nrfShown[pk])) + "%";
   g->setTextSize(1);
   g->setTextWrap(false);
@@ -3033,7 +3092,7 @@ void renderNRFSpectrum() {
     const uint16_t dark = rgb565(0, 0, 24);
     g->fillRect(L, T, W, H, dark);
     static uint16_t lut[101];
-    for (int v = 0; v <= 100; v++) lut[v] = (v < 3) ? dark : nrfHeat((float)v);
+    for (int v = 0; v <= 100; v++) lut[v] = (v < 3) ? dark : heatC((float)v);
     uint8_t colCh[W];
     for (int x = 0; x < W; x++) colCh[x] = (uint8_t)(x * NRF_CH / W);
 
@@ -3080,7 +3139,7 @@ void renderNRFSpectrum() {
       const int SEG = 4;
       const int segN = H / SEG;
       uint16_t lut[segN];
-      for (int k = 0; k < segN; k++) lut[k] = themeColor(nrfHeat(((float)k + 0.5f) * 100.0f / (float)segN));
+      for (int k = 0; k < segN; k++) lut[k] = themeColor(heatC(((float)k + 0.5f) * 100.0f / (float)segN));
 
       for (int ch = 0; ch < NRF_CH; ch++) {
         int x0 = L + W * ch / NRF_CH;
@@ -3108,7 +3167,7 @@ void renderNRFSpectrum() {
         int bw = bwAll - 2;
         int bh = (int)(H * wl[n - 1] / 100.0f);
         if (bh > H) bh = H;
-        if (bh > 0) g->fillRoundRect(x, B - bh, bw, bh, 2, themeColor(nrfHeat(wl[n - 1])));
+        if (bh > 0) g->fillRoundRect(x, B - bh, bw, bh, 2, themeColor(heatC(wl[n - 1])));
         String pct = String((int)lroundf(wl[n - 1]));
         int ty = B - bh - 10;
         if (ty < T - 4) ty = T - 4;
@@ -3120,6 +3179,12 @@ void renderNRFSpectrum() {
     }
 
     g->drawFastHLine(L, B, W, cM);
+  }
+
+  // frequency marker (BARS and FALL views)
+  if (nrfCursor >= 0 && nrfView != 2) {
+    int cx = L + (int)lroundf((float)W * (nrfCursor + 0.5f) / (float)NRF_CH);
+    g->drawFastVLine(cx, T, H, themeColor(C_YELLOW));
   }
 
   // x axis
@@ -5207,6 +5272,12 @@ void pollJoystick() {
       kbNext = now + 140;
       kbMove(dx, dx != 0 ? 0 : dy);
     }
+  }
+
+  // NRF24 spectrum: stick up/down moves the frequency marker (down = towards 2483 MHz)
+  if (page == NRF24_PAGE && subView == 2 && yHeld && now - lastNavigation > 70) {
+    lastNavigation = now;
+    nrfMoveCursor(yd);
   }
 
   if (!kbActive() && yHeld && now - lastNavigation > NAV_MS) {

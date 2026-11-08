@@ -274,8 +274,6 @@ int lineCount = 0;
 int pageSel = 0;
 float scrollPos = 0.0f;
 float scrollVel = 0.0f;          // spring velocity for smooth scrolling
-float bleScrollVisual = 0.0f;
-float bleScrollVisualTarget = 0.0f;
 float introP = 1.0f;             // 0..1 page/sub menu intro progress (1 = finished)
 bool uiDirty = true;
 unsigned long lastFrame = 0;
@@ -896,32 +894,6 @@ void renderPage() {
   flushCanvas();
 }
 
-void renderBleMediaCmd() {
-  renderPage();
-  Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
-  const int cx = 210;
-  const int cy = 243 + (int)lroundf(bleScrollVisual * 9.0f);
-  uint8_t brightness = (uint8_t)(90 + 165 * fminf(1.0f, fabsf(bleScrollVisual)));
-  uint16_t accent = dimc(themeColor(C_CYAN), brightness);
-  g->fillRoundRect(187, 216, 46, 56, 10, dimc(bgColor(), 230));
-  g->drawRoundRect(187, 216, 46, 56, 10, accent);
-  g->drawLine(cx, 224, cx, 260, dimc(accent, 100));
-  if (fabsf(bleScrollVisual) > 0.08f) {
-    if (bleScrollVisual < 0.0f) {
-      g->fillTriangle(cx, cy - 8, cx - 7, cy + 2, cx + 7, cy + 2, accent);
-    } else {
-      g->fillTriangle(cx, cy + 8, cx - 7, cy - 2, cx + 7, cy - 2, accent);
-    }
-  } else {
-    g->fillCircle(cx, cy, 3, dimc(accent, 120));
-  }
-  g->setTextSize(1);
-  g->setTextColor(accent);
-  g->setCursor(192, 263);
-  g->print("REELS");
-  flushCanvas();
-}
-
 const char *WEEKDAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 const char *MONTHS[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
 
@@ -1428,7 +1400,6 @@ void renderUI() {
   else if (radarActive()) renderRadar();
   else if (qrActive()) renderQR();
   else if (page == NRF24_PAGE && subView == 2) renderNRFSpectrum();
-  else if (page == BLE_PAGE && subView == 2) renderBleMediaCmd();
   else renderPage();
 }
 
@@ -1491,18 +1462,6 @@ void animateUI() {
   }
 
   if (radarActive()) uiDirty = true;            // radar sweep animates continuously
-  if (page == BLE_PAGE && subView == 2) {
-    float diff = bleScrollVisualTarget - bleScrollVisual;
-    if (fabsf(diff) > 0.002f) {
-      bleScrollVisual += diff * (1.0f - expf(-dt * 14.0f));
-      if (fabsf(bleScrollVisualTarget - bleScrollVisual) < 0.002f)
-        bleScrollVisual = bleScrollVisualTarget;
-      uiDirty = true;
-    }
-    if (fabsf(bleScrollVisual) > 0.002f) uiDirty = true;
-  } else {
-    bleScrollVisualTarget = 0.0f;
-  }
   if (uiDirty) {
     uiDirty = false;
     lastFrame = millis();
@@ -2026,7 +1985,6 @@ NimBLEServer *bleServer = nullptr;
 NimBLEService *bleHidSvc = nullptr;
 NimBLECharacteristic *bleMediaReport = nullptr;
 NimBLECharacteristic *bleKbReport = nullptr;
-NimBLECharacteristic *bleMouseReport = nullptr;
 bool bleHidOn = false;
 volatile bool bleHidConnected = false;       // a phone / PC is connected
 volatile bool bleHidReady = false;           // ...and it subscribed to the report (keys will really arrive)
@@ -2034,10 +1992,6 @@ volatile uint16_t bleConnHandle = 0xFFFF;
 String bleHidMsg = "";
 bool bleKeyPending = false;                  // a key is held, release is sent from pollBle()
 unsigned long bleKeyReleaseAt = 0;
-bool bleMousePending = false;
-unsigned long bleMouseReleaseAt = 0;
-int bleScrollLastDir = 0;
-unsigned long bleScrollNextAt = 0;
 int bleFirstKeyRow = -1;
 
 const char *BLE_MENU_ITEMS[] = {"BLE Scan", "Media Cmd"};
@@ -2101,12 +2055,6 @@ static BleReportCb bleRepCb;
 // Stop BLE HID: stop advertising and drop the connection
 void bleStopTx() {
   bleHidOn = false;
-  if (bleMousePending && bleMouseReport && bleHidConnected) {
-    uint8_t zero[4] = {};
-    bleMouseReport->setValue(zero, sizeof(zero));
-    bleMouseReport->notify();
-  }
-  bleMousePending = false;
   bleKeyPending = false;
   bleAdvStopNow();
   if (bleServer && bleHidConnected) bleServer->disconnect(bleConnHandle);
@@ -2120,7 +2068,7 @@ void bleStopAll() {
 }
 
 // ---------------- Media Cmd (BLE HID remote) ----------------
-// Consumer control report (ID 1), keyboard report (ID 2), and mouse wheel (ID 3):
+// Consumer control report (ID 1) and keyboard report (ID 2):
 //   bit0 Vol+  bit1 Vol-  bit2 Mute  bit3 Play/Pause  bit4 Next  bit5 Prev  bit6 Stop  bit7 Eject
 static const uint8_t HID_REPORT_MAP[] = {
   0x05, 0x0C,       // Usage Page (Consumer)
@@ -2174,36 +2122,7 @@ static const uint8_t HID_REPORT_MAP[] = {
   0x19, 0x00,       //   Usage Minimum (Reserved)
   0x29, 0x65,       //   Usage Maximum (Keyboard Application)
   0x81, 0x00,       //   Input (Data, Array)
-  0xC0,             // End Keyboard collection
-
-  0x05, 0x01,       // Usage Page (Generic Desktop)
-  0x09, 0x02,       // Usage (Mouse)
-  0xA1, 0x01,       // Collection (Application)
-  0x85, 0x03,       //   Report ID 3
-  0x09, 0x01,       //   Usage (Pointer)
-  0xA1, 0x00,       //   Collection (Physical)
-  0x05, 0x09,       //     Usage Page (Button)
-  0x19, 0x01,       //     Usage Minimum (Button 1)
-  0x29, 0x03,       //     Usage Maximum (Button 3)
-  0x15, 0x00,       //     Logical Minimum (0)
-  0x25, 0x01,       //     Logical Maximum (1)
-  0x95, 0x03,       //     Report Count (3)
-  0x75, 0x01,       //     Report Size (1)
-  0x81, 0x02,       //     Input (Data, Variable, Absolute)
-  0x95, 0x01,       //     Report Count (1)
-  0x75, 0x05,       //     Report Size (5)
-  0x81, 0x01,       //     Input (Constant): padding
-  0x05, 0x01,       //     Usage Page (Generic Desktop)
-  0x09, 0x30,       //     Usage (X)
-  0x09, 0x31,       //     Usage (Y)
-  0x09, 0x38,       //     Usage (Wheel)
-  0x15, 0x81,       //     Logical Minimum (-127)
-  0x25, 0x7F,       //     Logical Maximum (127)
-  0x75, 0x08,       //     Report Size (8)
-  0x95, 0x03,       //     Report Count (3)
-  0x81, 0x06,       //     Input (Data, Variable, Relative)
-  0xC0,             //   End Physical collection
-  0xC0              // End Mouse collection
+  0xC0              // End Keyboard collection
 };
 
 // Sends one 1-byte HID report (report ID is added by the stack through the Report Reference descriptor)
@@ -2211,13 +2130,6 @@ bool bleMediaSend(uint8_t bits) {
   if (!bleMediaReport || !bleHidConnected) return false;
   bleMediaReport->setValue(&bits, 1);
   return bleMediaReport->notify();
-}
-
-bool bleMouseSendWheel(int8_t wheel) {
-  if (!bleMouseReport || !bleHidConnected) return false;
-  uint8_t report[4] = {0, 0, 0, (uint8_t)wheel};
-  bleMouseReport->setValue(report, sizeof(report));
-  return bleMouseReport->notify();
 }
 
 // Press now, release is sent ~60 ms later by pollBle() (no blocking delay)
@@ -2269,15 +2181,6 @@ void bleMediaStart() {
     uint8_t kbRef[2] = {2, 0x01};                                // report ID 2, type 1 = input
     NimBLEDescriptor *kbRd = bleKbReport->createDescriptor("2908", NIMBLE_PROPERTY::READ);
     kbRd->setValue(kbRef, sizeof(kbRef));
-    bleMouseReport = bleHidSvc->createCharacteristic("2A4D",
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
-    uint8_t mouseZero[4] = {};
-    bleMouseReport->setValue(mouseZero, sizeof(mouseZero));
-    bleMouseReport->setCallbacks(&bleRepCb);
-    uint8_t mouseRef[2] = {3, 0x01};
-    NimBLEDescriptor *mouseRd = bleMouseReport->createDescriptor("2908", NIMBLE_PROPERTY::READ);
-    mouseRd->setValue(mouseRef, sizeof(mouseRef));
-
     // --- Device Information (PnP ID is required by several hosts) ---
     NimBLEService *dis = bleServer->createService("180A");
     NimBLECharacteristic *man = dis->createCharacteristic("2A29", NIMBLE_PROPERTY::READ);
@@ -2425,7 +2328,6 @@ void buildBle() {
       if (bleHidOn) {
         if (!bleHidConnected) addWrapped("Pair 'WatchOut Remote' in BT settings", C_MUTED);
         if (bleHidMsg.length()) addWrapped(bleHidMsg, C_CYAN);
-        addWrapped("Joystick Y: scroll reels", C_MUTED);
         bleAddActRow(BLE_ACT_KEY | HID_PLAY_PAUSE, "Play / Pause", C_WHITE);
         bleAddActRow(BLE_ACT_KEY | HID_VOL_UP,     "Volume +",     C_WHITE);
         bleAddActRow(BLE_ACT_KEY | HID_VOL_DOWN,   "Volume -",     C_WHITE);
@@ -2438,7 +2340,7 @@ void buildBle() {
         bleAddActRow(BLE_ACT_STOP,                 "> Stop",       C_RED);
       } else {
         if (bleHidMsg.length()) addWrapped(bleHidMsg, C_YELLOW);
-        addWrapped("Media, camera and reel scroll over BLE HID", C_MUTED);
+        addWrapped("Media and camera controls over BLE HID", C_MUTED);
         bleAddActRow(BLE_ACT_START, "> Start", C_GREEN);
       }
       break;
@@ -2467,10 +2369,6 @@ void bleClick() {
           bleDoScan();
         } else {
           bleMediaStart();
-          bleScrollLastDir = 0;
-          bleScrollNextAt = 0;
-          bleScrollVisual = 0.0f;
-          bleScrollVisualTarget = 0.0f;
           buildBle();
           if (bleFirstKeyRow > 0) {               // start on the first key instead of the status row
             pageSel = bleFirstKeyRow;
@@ -2537,9 +2435,6 @@ void bleBack() {
   }
   if (subView != 0) {
     bleStopTx();
-    bleScrollLastDir = 0;
-    bleScrollNextAt = 0;
-    bleScrollVisualTarget = 0.0f;
     subView = 0;
     pageSel = subParentSel;
     scrollPos = (float)pageSel;
@@ -2557,11 +2452,6 @@ void pollBle() {
     bleMediaSend(0);
     bleKeyPending = false;
   }
-  if (bleMousePending && (long)(now - bleMouseReleaseAt) >= 0) {
-    bleMouseSendWheel(0);
-    bleMousePending = false;
-  }
-
   // keep advertising while we wait for a phone / PC (advertising stops after a disconnect)
   if (bleHidOn && !bleHidConnected && bleAdv && !bleAdv->isAdvertising()) {
     bleAdv->start();
@@ -5255,34 +5145,6 @@ void pollJoystick() {
 
   if (yd != yPrev) { yPrev = yd; ySince = now; }
   bool yHeld = (yd != 0) && (now - ySince >= 30);
-
-  if (page == BLE_PAGE && subView == 2) {
-    bleScrollVisualTarget = (float)yd;
-    if (yd == 0) {
-      bleScrollLastDir = 0;
-      bleScrollNextAt = 0;
-    } else if (yHeld && (yd != bleScrollLastDir || now >= bleScrollNextAt)) {
-      bool directionChanged = yd != bleScrollLastDir;
-      if (bleMousePending) {
-        bleMouseSendWheel(0);
-        bleMousePending = false;
-      }
-      if (bleHidOn && bleHidReady &&
-          bleMouseSendWheel((int8_t)(yd < 0 ? 1 : -1))) {
-        bleMousePending = true;
-        bleMouseReleaseAt = now + 40;
-      } else if (directionChanged) {
-        bleHidMsg = bleHidConnected ? "Pair again for scroll" : "Not connected";
-        uiDirty = true;
-      }
-      bleScrollLastDir = yd;
-      bleScrollNextAt = now + 140;
-    }
-  } else {
-    bleScrollVisualTarget = 0.0f;
-    bleScrollLastDir = 0;
-    bleScrollNextAt = 0;
-  }
 
   if (leftHeld || rightHeld || yHeld || swStable) markActivity();
   if (x < 2500) rightSwipeArmed = true;

@@ -31,7 +31,7 @@
 #define VAULT_KEY_MS        20         // time for each key press / release; raise it if characters get lost
 #define VAULT_TYPE_DELAY_MS 500        // pause between clicking "Type" and the first character
 #define VAULT_KDF_ITER      20000      // PBKDF2 rounds (stored in the file, so you may change it later)
-#define VAULT_PIN_MIN       8          // minimum PIN / passphrase length
+#define VAULT_PIN_MIN       4          // minimum PIN / passphrase length
 #define VAULT_PIN_MAX       63
 #define VAULT_MAX_ENTRIES   40         // list plus actions and memory status fits within MAX_LINES
 #define VAULT_NAME_MAX      24
@@ -1221,7 +1221,7 @@ static void vltKbOk() {
   String in = vaultInput;
   switch (vltState) {
     case VLT_NEWPIN1:
-      if (in.length() < VAULT_PIN_MIN) { vltKbFail("FAILED: min 8 chars"); break; }
+      if (in.length() < VAULT_PIN_MIN) { vltKbFail("FAILED: min 4 chars"); break; }
       vltPin1 = in;
       vltOpenKb(VLT_NEWPIN2, "Repeat PIN", VAULT_PIN_MAX, true);
       break;
@@ -1229,7 +1229,7 @@ static void vltKbOk() {
     case VLT_NEWPIN2:
       if (in != vltPin1) {
         vltWipeStr(vltPin1);
-        vltOpenKb(VLT_NEWPIN1, "New PIN (8-63 chars)", VAULT_PIN_MAX, true);
+        vltOpenKb(VLT_NEWPIN1, "New PIN (4-63 chars)", VAULT_PIN_MAX, true);
         vltKbFail("FAILED: no match");
       } else {
         vltFinishPin(in);
@@ -1365,7 +1365,7 @@ void vaultEnter() {
   if (has) {
     vltSetState(VLT_LOCKED);
   } else {                                             // first run: create the PIN
-    vltOpenKb(VLT_NEWPIN1, "New PIN (8-63 chars)", VAULT_PIN_MAX, true);
+    vltOpenKb(VLT_NEWPIN1, "New PIN (4-63 chars)", VAULT_PIN_MAX, true);
   }
 }
 
@@ -1444,7 +1444,7 @@ void vaultClick() {
 
       case VA_CHGPIN:
         vltChgPin = true;
-        vltOpenKb(VLT_NEWPIN1, "New PIN (8-63 chars)", VAULT_PIN_MAX, true);
+        vltOpenKb(VLT_NEWPIN1, "New PIN (4-63 chars)", VAULT_PIN_MAX, true);
         break;
 
       case VA_TIMEOUT: {

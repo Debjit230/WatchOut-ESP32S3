@@ -127,6 +127,12 @@ uint8_t nrfView = 0;                 // 0 bars + peak hold, 1 waterfall, 2 Wi-Fi
 uint32_t nrfSweeps = 0;
 float   nrfSweepRate = 0.0f;         // sweeps per second
 unsigned long nrfLastRow = 0;
+bool    nrfJamActive = false;
+int     jamChannel = 76;
+uint8_t jamPayload = 0xAA;
+unsigned long nrfJamTimer = 0;
+const uint32_t NRF_JAM_INTERVAL_MS = 10;
+const uint64_t NRF_JAM_PIPE_ADDR = 0xE7E7E7E7E7ULL;
 
 GFXcanvas16 *canvas = nullptr;
 bool canvasReady = false;
@@ -2806,14 +2812,45 @@ void startNRF24() {
   digitalWrite(LORA_CS, HIGH);
   nrf24Ready = nrf24.begin() && nrf24.isChipConnected();
   nrf24Scanned = false;
-  if (!nrf24Ready) return;
+  if (!nrf24Ready) {
+    Serial.println("[NRF24] begin() failed - radio not found");
+    return;
+  }
 
+  Serial.println("[NRF24] begin() succeeded - radio ready");
   nrf24.setAutoAck(false);
   nrf24.disableCRC();
   nrf24.setDataRate(RF24_1MBPS);
   nrf24.setPALevel(RF24_PA_MIN);
   nrf24.setChannel(76);
   nrf24.stopListening();
+}
+
+static void nrfJamInit() {
+  if (!nrf24Ready) return;
+  nrf24.stopListening();
+  nrf24.openWritingPipe(NRF_JAM_PIPE_ADDR);
+  nrf24.setChannel(jamChannel);
+  nrf24.setPALevel(RF24_PA_MAX);
+  nrf24.setDataRate(RF24_1MBPS);
+  nrf24.disableCRC();
+  nrf24.setAutoAck(false);
+}
+
+void nrfJamStart() {
+  if (!nrf24Ready) startNRF24();
+  if (!nrf24Ready) return;
+  nrfJamActive = true;
+  nrfJamInit();
+  nrfJamTimer = millis();
+  uiDirty = true;
+}
+
+void nrfJamStop() {
+  nrfJamActive = false;
+  nrf24.stopListening();
+  nrf24.setChannel(76);
+  uiDirty = true;
 }
 
 // Called every time the Spectrum sub view opens: clears all history and restarts the sweep
@@ -3064,7 +3101,7 @@ static void nrfFinishSweep() {
 // Scans as many channels as fit into NRF_SLICE_US, then returns so the UI keeps running.
 // Paused while a Wi-Fi scan is running (the ESP32's own probe requests would show up as signals).
 void scanNRF24Spectrum() {
-  if (!nrf24Ready || wifiStarted) return;
+  if (!nrf24Ready || wifiStarted || nrfJamActive) return;
   unsigned long t0 = micros();
   while (micros() - t0 < (unsigned long)NRF_SLICE_US) {
     uint8_t ch = nrfScanCh;
@@ -3105,6 +3142,21 @@ static void nrfWifiPoll() {
 
 void pollNRF24Spectrum() {
   if (page != NRF24_PAGE || subView != 2) return;
+
+  if (nrfJamActive) {
+    if (!nrf24Ready) return;
+    if (millis() - nrfJamTimer >= NRF_JAM_INTERVAL_MS) {
+      nrf24.stopListening();
+      nrf24.setChannel(jamChannel);
+      bool ok = nrf24.write(&jamPayload, 1);
+      Serial.printf("[Jammer] wrote %s (payload 0x%02X) on channel %d\n",
+                    ok ? "OK" : "FAIL", jamPayload, jamChannel);
+      delayMicroseconds(100);
+      nrfJamTimer = millis();
+    }
+    return;
+  }
+
   nrfWifiPoll();
   if (!nrf24Ready || nrfHold) return;
   scanNRF24Spectrum();
@@ -3514,7 +3566,6 @@ void renderNRFSpectrum() {
     }
     g->setTextColor(cM);
     g->setCursor(L, 270);
-    g->print("Load %  /  cyan = APs seen");
   } else {
     // Wi-Fi channel ticks: channel n is centred on nRF channel 7 + 5n
     for (int n = 1; n <= 13; n++) {
@@ -5396,6 +5447,7 @@ void leavePageCleanup() {
   }
   if (page == BLE_PAGE) { bleDetailView = false; bleStopAll(); }
   if (page == NRF24_PAGE) {
+    if (nrfJamActive) nrfJamStop();
     if (nrf24Ready) nrf24.stopListening();
     if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }   // drop a DEVS-view Wi-Fi scan that is still running
   }

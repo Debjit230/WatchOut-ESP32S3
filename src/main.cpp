@@ -123,7 +123,7 @@ uint8_t nrfScanCh = 0;               // channel the running sweep is on
 uint8_t nrfPass   = 0;               // which of the NRF_SAMPLES passes is running
 int     nrfCursor = -1;              // -1 = off, 0..83 = marker channel
 bool    nrfHold = false;             // long press = freeze the display
-uint8_t nrfView = 0;                 // 0 bars + peak hold, 1 waterfall, 2 Wi-Fi channel load
+uint8_t nrfView = 0;                 // 0 bars + peak hold, 1 waterfall, 2 Wi-Fi channel load, 3 identified devices
 uint32_t nrfSweeps = 0;
 float   nrfSweepRate = 0.0f;         // sweeps per second
 unsigned long nrfLastRow = 0;
@@ -2760,17 +2760,46 @@ void startLoRa() {
   }
 }
 
-// ======================= NRF24 SPECTRUM ANALYZER =======================
+// ======================= NRF24 SPECTRUM ANALYZER v2 =======================
 // * continuous, non-blocking sweep of all 84 channels (2400..2483 MHz), a few ms per loop pass
 // * INTERLEAVED sampling: NRF_SAMPLES full passes over all channels per sweep, so a short burst
 //   is spread over time instead of being counted 4x or missed 4x
 // * time-based smoothing (attack / release / peak fall are in ms, independent of the sweep rate)
-// * three views (click to cycle): BARS (+ peak hold), FALL (waterfall history), WIFI (load per Wi-Fi channel 1..13)
-// * stick up/down = move a frequency marker (readout shows MHz, activity, peak, Wi-Fi / BLE channel)
+// * four views (click to cycle): BARS (+ peak hold), FALL (waterfall history),
+//   WIFI (load per Wi-Fi channel 1..13), DEVS (automatic signal identification)
+// * DEVS: Wi-Fi, BLE adverts, ZigBee, wideband/microwave, frequency hoppers, continuous carriers,
+//   narrow devices. Wi-Fi signals are labelled with real SSIDs from a Wi-Fi scan.
+// * colored identification strip drawn over BARS / FALL, the marker readout names the device
+// * long-term (2.5 s) average is used for classification so short bursts don't flicker the list
+// * stick up/down = move a frequency marker (BARS/FALL) or select a signal (DEVS)
 // * long press = HOLD / resume (resume also clears the peak markers)
 // * Wi-Fi channel n is centred on 2407 + 5n MHz, i.e. nRF channel 7 + 5n
-// RPD only reports "signal stronger than -64 dBm on this channel", so the percentage is how often
-// the channel was busy, not a calibrated power level.
+// NOTE: RPD only reports "signal stronger than -64 dBm on this channel", so the percentage is how
+// often the channel was busy, not a calibrated power level, and identification is pattern based
+// (width, position, persistence). Labels with a '?' are best guesses.
+// While the Wi-Fi scan runs (~2-3 s) the nRF sweep is paused so the ESP32's own
+// transmissions are not mistaken for outside signals.
+
+// ---------------- device identification state ----------------
+#define NRF_SLOW_MS  2500.0f         // time constant of the long-term average used for classification
+#define NRF_MAXDEV   8
+
+enum NrfDevType : uint8_t { DEV_WIFI, DEV_BLE, DEV_ZIGBEE, DEV_WIDE, DEV_HOP, DEV_CARRIER, DEV_NARROW };
+
+struct NrfDev {
+  uint8_t type;
+  uint8_t lo, hi;                    // channel range (0..83)
+  uint8_t level;                     // activity % (long-term)
+  char name[16];
+  char note[36];
+};
+
+float nrfSlow[NRF_CH] = {};          // long-term activity per channel (0..100)
+NrfDev nrfDev[NRF_MAXDEV];
+int nrfDevCount = 0;
+int nrfDevSel = 0;
+unsigned long nrfLastClassify = 0;
+unsigned long nrfLastWifiScan = 0;
 
 void startNRF24() {
   digitalWrite(LCD_CS, HIGH);
@@ -2791,6 +2820,7 @@ void startNRF24() {
 void nrfSpectrumBegin() {
   memset(nrf24Activity, 0, sizeof(nrf24Activity));
   memset(nrfAvg, 0, sizeof(nrfAvg));
+  memset(nrfSlow, 0, sizeof(nrfSlow));
   memset(nrfPeak, 0, sizeof(nrfPeak));
   memset(nrfShown, 0, sizeof(nrfShown));
   memset(nrfHits, 0, sizeof(nrfHits));
@@ -2803,12 +2833,176 @@ void nrfSpectrumBegin() {
   nrfSweeps = 0;
   nrfSweepRate = 0.0f;
   nrfLastRow = 0;
+  nrfDevCount = 0;
+  nrfDevSel = 0;
+  nrfLastClassify = 0;
   nrf24Scanned = false;
   if (!nrf24Ready || !nrf24.isChipConnected()) startNRF24();   // retry if the radio was missing before
+
+  nrfLastWifiScan = millis();                                  // Wi-Fi scan -> SSID labels for detected Wi-Fi signals
+  startWiFiScan();
   uiDirty = true;
 }
 
-// A full sweep just finished: update smoothing, peaks, waterfall and the sweep rate
+// ---------------- device identification ----------------
+static void nrfAddDev(uint8_t type, int lo, int hi, float level, const String &name, const String &note) {
+  if (nrfDevCount >= NRF_MAXDEV) return;
+  if (lo < 0) lo = 0;
+  if (hi > NRF_CH - 1) hi = NRF_CH - 1;
+  int lv = (int)lroundf(level);
+  if (lv < 0) lv = 0;
+  if (lv > 100) lv = 100;
+  NrfDev &d = nrfDev[nrfDevCount++];
+  d.type = type;
+  d.lo = (uint8_t)lo;
+  d.hi = (uint8_t)hi;
+  d.level = (uint8_t)lv;
+  strlcpy(d.name, name.c_str(), sizeof(d.name));
+  strlcpy(d.note, note.c_str(), sizeof(d.note));
+}
+
+// strongest SSID seen by the Wi-Fi scan on channel n, and how many APs are on it
+static String nrfSsidOn(int n, int &aps) {
+  aps = 0;
+  int best = -200;
+  String s = "";
+  for (int i = 0; i < wifiCount; i++) {
+    if (wifiList[i].channel != n) continue;
+    aps++;
+    if (wifiList[i].rssi > best) {
+      best = wifiList[i].rssi;
+      s = wifiList[i].ssid.length() ? wifiList[i].ssid : String("<hidden>");
+    }
+  }
+  return s;
+}
+
+static void nrfClassify() {
+  nrfDevCount = 0;
+  int wifiC[13];
+  int wifiN = 0;
+
+  // ---- 1) Wi-Fi: a flat, ~20 MHz wide plateau centred on 2407 + 5n MHz ----
+  float wl[15] = {};
+  float fr[15] = {};
+  for (int n = 1; n <= 13; n++) {
+    int c = 7 + 5 * n;
+    float sum = 0.0f;
+    int cnt = 0, act = 0;
+    for (int ch = c - 9; ch <= c + 9; ch++) {
+      if (ch < 0 || ch >= NRF_CH) continue;
+      sum += nrfSlow[ch];
+      cnt++;
+      if (nrfSlow[ch] > 4.0f) act++;
+    }
+    wl[n] = cnt ? sum / cnt : 0.0f;
+    fr[n] = cnt ? (float)act / cnt : 0.0f;
+  }
+  for (int n = 1; n <= 13; n++) {
+    if (wl[n] >= 9.0f && fr[n] >= 0.6f && wl[n] > wl[n - 1] && wl[n] >= wl[n + 1]) {
+      int c = 7 + 5 * n;
+      int aps = 0;
+      String ssid = nrfSsidOn(n, aps);
+      String note;
+      if (ssid.length()) {
+        note = ssid.substring(0, 24);
+        if (aps > 1) note += " +" + String(aps - 1);
+      } else {
+        note = wifiCount ? "No AP seen on this ch" : "Run Wi-Fi scan for names";
+      }
+      nrfAddDev(DEV_WIFI, c - 10, c + 10, wl[n], "Wi-Fi ch " + String(n), note);
+      if (wifiN < 13) wifiC[wifiN++] = c;
+    }
+  }
+
+  // ---- 2) wideband: a long unbroken run of busy channels (too wide for one Wi-Fi channel) ----
+  int run = 0, runStart = 0, bestRun = 0, bestStart = 0;
+  float runSum = 0.0f, bestSum = 0.0f;
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    if (nrfSlow[ch] > 6.0f) {
+      if (!run) { runStart = ch; runSum = 0.0f; }
+      run++;
+      runSum += nrfSlow[ch];
+      if (run > bestRun) { bestRun = run; bestStart = runStart; bestSum = runSum; }
+    } else {
+      run = 0;
+    }
+  }
+  bool wide = false;
+  if (bestRun >= 30 && bestSum / bestRun >= 14.0f) {
+    wide = true;
+    nrfAddDev(DEV_WIDE, bestStart, bestStart + bestRun - 1, bestSum / bestRun,
+              "Wideband", "Microwave/jammer? " + String(2400 + bestStart) + "-" + String(2400 + bestStart + bestRun - 1));
+  }
+
+  // ---- 3) narrow spikes: BLE adverts, ZigBee, carriers, small 2.4G devices ----
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    float v = nrfSlow[ch];
+    if (v < 18.0f) continue;
+
+    bool pk = true;
+    for (int d = -2; d <= 2; d++) {
+      if (d == 0) continue;
+      int k = ch + d;
+      if (k < 0 || k >= NRF_CH) continue;
+      if (nrfSlow[k] > v || (nrfSlow[k] == v && d < 0)) { pk = false; break; }
+    }
+    if (!pk) continue;
+
+    float nb = 0.0f;
+    int cnt = 0;
+    for (int d = 2; d <= 4; d++) {
+      if (ch - d >= 0)       { nb += nrfSlow[ch - d]; cnt++; }
+      if (ch + d < NRF_CH)   { nb += nrfSlow[ch + d]; cnt++; }
+    }
+    if (cnt) nb /= cnt;
+    if (v - nb < 15.0f) continue;                       // not a spike, part of something wider
+
+    int lo = ch, hi = ch;
+    while (lo > 0 && nrfSlow[lo - 1] >= v * 0.5f) lo--;
+    while (hi < NRF_CH - 1 && nrfSlow[hi + 1] >= v * 0.5f) hi++;
+    if (hi - lo > 5) continue;                          // too wide to be a narrow signal
+
+    String freq = String(2400 + ch) + " MHz";
+    if (abs(ch - 2) <= 1 || abs(ch - 26) <= 1 || abs(ch - 80) <= 1) {
+      int adv = abs(ch - 2) <= 1 ? 37 : (abs(ch - 26) <= 1 ? 38 : 39);
+      nrfAddDev(DEV_BLE, lo, hi, v, "BLE advert", "Ch " + String(adv) + "  " + freq);
+    } else if (ch >= 5 && ch <= 80 && (ch - 5) % 5 == 0 && v < 70.0f) {
+      nrfAddDev(DEV_ZIGBEE, lo, hi, v, "ZigBee?", "802.15.4 ch " + String(11 + (ch - 5) / 5) + "  " + freq);
+    } else if (v >= 70.0f) {
+      nrfAddDev(DEV_CARRIER, lo, hi, v, freq, "Continuous: video/baby mon?");
+    } else {
+      nrfAddDev(DEV_NARROW, lo, hi, v, freq, "Mouse/kbd/toy/remote?");
+    }
+  }
+
+  // ---- 4) frequency hopper: weak activity spread over many channels outside any Wi-Fi plateau ----
+  int spread = 0;
+  float hs = 0.0f;
+  for (int ch = 0; ch < NRF_CH; ch++) {
+    float v = nrfSlow[ch];
+    if (v < 2.0f || v > 25.0f) continue;
+    bool inWifi = false;
+    for (int i = 0; i < wifiN; i++) if (abs(ch - wifiC[i]) <= 10) { inWifi = true; break; }
+    if (inWifi) continue;
+    spread++;
+    hs += v;
+  }
+  if (!wide && spread >= 22) {
+    nrfAddDev(DEV_HOP, 0, NRF_CH - 1, hs / spread, "Hopping", "Bluetooth/FHSS? " + String(spread) + " ch");
+  }
+
+  // sort strongest first (insertion sort, max 8 entries)
+  for (int i = 1; i < nrfDevCount; i++) {
+    NrfDev t = nrfDev[i];
+    int j = i - 1;
+    while (j >= 0 && nrfDev[j].level < t.level) { nrfDev[j + 1] = nrfDev[j]; j--; }
+    nrfDev[j + 1] = t;
+  }
+  if (nrfDevSel >= nrfDevCount) nrfDevSel = nrfDevCount > 0 ? nrfDevCount - 1 : 0;
+}
+
+// A full sweep just finished: update smoothing, peaks, waterfall, classification and the sweep rate
 static void nrfFinishSweep() {
   unsigned long now = millis();
   static unsigned long lastT = 0;
@@ -2817,6 +3011,7 @@ static void nrfFinishSweep() {
   lastT = now;
   const float kA   = 1.0f - expf(-dt * 1000.0f / NRF_ATTACK_MS);
   const float kR   = 1.0f - expf(-dt * 1000.0f / NRF_RELEASE_MS);
+  const float kS   = 1.0f - expf(-dt * 1000.0f / NRF_SLOW_MS);
   const float fall = NRF_PEAK_FALL * dt;
 
   bool pushRow = (now - nrfLastRow >= 80);
@@ -2832,6 +3027,8 @@ static void nrfFinishSweep() {
     float a = nrfAvg[ch];
     a += (inst - a) * (inst > a ? kA : kR);
     nrfAvg[ch] = a;
+
+    nrfSlow[ch] += (inst - nrfSlow[ch]) * kS;
 
     if (a >= nrfPeak[ch]) {
       nrfPeak[ch] = a;
@@ -2851,6 +3048,11 @@ static void nrfFinishSweep() {
     markT = now;
   }
 
+  if (now - nrfLastClassify >= 400) {              // classify a few times per second, not every sweep
+    nrfLastClassify = now;
+    nrfClassify();
+  }
+
   if (!nrf24.isChipConnected()) {                  // radio unplugged / lost power
     nrf24Ready = false;
     return;
@@ -2860,9 +3062,9 @@ static void nrfFinishSweep() {
 }
 
 // Scans as many channels as fit into NRF_SLICE_US, then returns so the UI keeps running.
-// One sweep = NRF_SAMPLES passes over all channels; hits accumulate in nrfHits[].
+// Paused while a Wi-Fi scan is running (the ESP32's own probe requests would show up as signals).
 void scanNRF24Spectrum() {
-  if (!nrf24Ready) return;
+  if (!nrf24Ready || wifiStarted) return;
   unsigned long t0 = micros();
   while (micros() - t0 < (unsigned long)NRF_SLICE_US) {
     uint8_t ch = nrfScanCh;
@@ -2884,8 +3086,27 @@ void scanNRF24Spectrum() {
   }
 }
 
+// Collects the Wi-Fi scan result (pollWiFi() only runs on the Wi-Fi page) and refreshes it every 30 s in DEVS view
+static void nrfWifiPoll() {
+  if (wifiStarted) {
+    int r = WiFi.scanComplete();
+    if (r >= 0) {
+      mergeWifiResults(r);
+      wifiStarted = false;
+      nrfLastClassify = 0;                         // re-classify right away with the new SSID names
+    } else if (r == WIFI_SCAN_FAILED) {
+      wifiStarted = false;
+    }
+  } else if (nrfView == 3 && millis() - nrfLastWifiScan > 30000UL) {
+    nrfLastWifiScan = millis();
+    startWiFiScan();
+  }
+}
+
 void pollNRF24Spectrum() {
-  if (page != NRF24_PAGE || subView != 2 || !nrf24Ready || nrfHold) return;
+  if (page != NRF24_PAGE || subView != 2) return;
+  nrfWifiPoll();
+  if (!nrf24Ready || nrfHold) return;
   scanNRF24Spectrum();
 }
 
@@ -2901,8 +3122,18 @@ bool nrfLongClick() {
   return true;
 }
 
-// Moves the frequency marker. Moving past the left edge turns it off.
+// Stick up/down: moves the frequency marker (BARS/FALL) or selects a signal (DEVS).
 void nrfMoveCursor(int d) {
+  if (nrfView == 3) {
+    if (nrfDevCount > 0) {
+      int s = nrfDevSel + d;
+      if (s < 0) s = 0;
+      if (s > nrfDevCount - 1) s = nrfDevCount - 1;
+      nrfDevSel = s;
+      uiDirty = true;
+    }
+    return;
+  }
   int c = nrfCursor + d;
   if (c < -1) c = -1;
   if (c > NRF_CH - 1) c = NRF_CH - 1;
@@ -2915,7 +3146,7 @@ void nrfMoveCursor(int d) {
   uiDirty = true;
 }
 
-// Readout for the marker: frequency, activity, peak and the matching Wi-Fi / BLE advertising channel
+// Readout for the marker: frequency, activity, peak, matching Wi-Fi / BLE channel and detected device
 static String nrfCursorInfo(int c) {
   String s = String(2400 + c) + "MHz " + String((int)lroundf(nrfShown[c])) + "% pk" +
              String((int)lroundf(nrfPeak[c]));
@@ -2924,6 +3155,12 @@ static String nrfCursorInfo(int c) {
   } else {
     int n = (int)lroundf((c - 7) / 5.0f);
     if (n >= 1 && n <= 13 && abs(c - (7 + 5 * n)) <= 2) s += " W" + String(n);
+  }
+  for (int i = 0; i < nrfDevCount; i++) {
+    if (nrfDev[i].type != DEV_HOP && c >= nrfDev[i].lo && c <= nrfDev[i].hi) {
+      s += String(" ") + nrfDev[i].name;
+      break;
+    }
   }
   return s;
 }
@@ -2946,6 +3183,7 @@ void buildNRF24Info() {
   addLine("ISM range", "2400-2483 MHz", C_MUTED, C_WHITE);
   addLine("Samples/ch", String(NRF_SAMPLES), C_MUTED, C_WHITE);
   addLine("Sweeps/s", String(nrfSweepRate, 1), C_MUTED, C_WHITE);
+  addLine("Signals", String(nrfDevCount), C_MUTED, C_WHITE);
 }
 
 void buildNRF24() {
@@ -3015,16 +3253,30 @@ static float nrfWifiLoad(int n) {
   return (mean + mx) * 0.5f;
 }
 
+// colour per identified device type
+static uint16_t nrfDevColor(uint8_t t) {
+  switch (t) {
+    case DEV_WIFI:    return themeColor(C_CYAN);
+    case DEV_BLE:     return themeColor(rgb565(120, 120, 255));
+    case DEV_ZIGBEE:  return themeColor(rgb565(255, 159, 10));
+    case DEV_WIDE:    return themeColor(C_RED);
+    case DEV_HOP:     return themeColor(rgb565(200, 100, 255));
+    case DEV_CARRIER: return themeColor(C_YELLOW);
+    default:          return themeColor(C_GREEN);
+  }
+}
+
 void renderNRFSpectrum() {
   Adafruit_GFX *g = canvasReady ? (Adafruit_GFX *)canvas : (Adafruit_GFX *)&lcd;
   g->fillScreen(bgColor());
 
-  static const char *VIEW_NAMES[] = {"BARS", "FALL", "WIFI"};
+  static const char *VIEW_NAMES[] = {"BARS", "FALL", "WIFI", "DEVS"};
   const uint16_t cW = themeColor(C_WHITE);
   const uint16_t cM = themeColor(C_MUTED);
 
   boldText(g, 10, 8, String("NRF24 ") + VIEW_NAMES[nrfView], themeColor(C_CYAN), 2, 1);
   if (nrfHold) boldText(g, 228 - 48, 8, "HOLD", themeColor(C_RED), 2, 1);
+  else if (wifiStarted) boldText(g, 228 - 48, 8, "SCAN", themeColor(C_YELLOW), 2, 1);
 
   if (!nrf24Ready) {
     boldText(g, 10, 90, "RADIO NOT FOUND", themeColor(C_RED), 2, 1);
@@ -3073,7 +3325,8 @@ void renderNRFSpectrum() {
 
   // info lines
   String info;
-  if (nrfView == 2) info = "BEST CH " + String(bestWifi + 1) + " (" + String((int)lroundf(wl[bestWifi])) + "% busy)";
+  if (nrfView == 3) info = String(nrfDevCount) + (nrfDevCount == 1 ? " signal found" : " signals found");
+  else if (nrfView == 2) info = "BEST CH " + String(bestWifi + 1) + " (" + String((int)lroundf(wl[bestWifi])) + "% busy)";
   else if (nrfCursor >= 0) info = nrfCursorInfo(nrfCursor);
   else info = "PEAK " + String(2400 + pk) + " MHz " + String((int)lroundf(nrfShown[pk])) + "%";
   g->setTextSize(1);
@@ -3081,11 +3334,52 @@ void renderNRFSpectrum() {
   g->setTextColor(cM);
   g->setCursor(10, 29);
   g->print(info);
+  if (nrfView == 3 && nrfDevCount > 0) {
+    String sel = String(nrfDevSel + 1) + "/" + String(nrfDevCount);
+    g->setCursor(232 - (int)sel.length() * 6, 29);
+    g->print(sel);
+  }
   g->setCursor(10, 41);
   g->print(String("AVG ") + String(avgBusy) + "%");
   String rate = String(nrfSweepRate, 1) + " sw/s";
   g->setCursor(232 - (int)rate.length() * 6, 41);
   g->print(rate);
+
+  if (nrfView == 3) {
+    // ---------------- IDENTIFIED SIGNALS ----------------
+    const int rowH = 40, y0 = 54, rows = 5;
+    if (nrfDevCount == 0) {
+      boldText(g, 10, 100, "No signals yet", themeColor(C_YELLOW), 2, 1);
+      g->setTextSize(1);
+      g->setTextColor(cM);
+      g->setCursor(10, 128);
+      g->print("Listening... needs ~3 s of data");
+      g->setCursor(10, 142);
+      g->print("Click = next view");
+    } else {
+      int top = nrfDevSel - 2;
+      if (top > nrfDevCount - rows) top = nrfDevCount - rows;
+      if (top < 0) top = 0;
+      for (int r = 0; r < rows && top + r < nrfDevCount; r++) {
+        int i = top + r;
+        const NrfDev &d = nrfDev[i];
+        int y = y0 + r * rowH;
+        bool s = (i == nrfDevSel);
+        uint16_t col = nrfDevColor(d.type);
+        if (s) g->fillRoundRect(4, y, 232, rowH - 3, 5, lightMode ? 0xDEFB : 0x2104);
+        g->fillCircle(16, y + 13, 6, col);
+        boldText(g, 30, y + 6, String(d.name), s ? cW : cM, 2, 1);
+        String lv = String((int)d.level) + "%";
+        boldText(g, 228 - (int)lv.length() * 12, y + 6, lv, col, 2, 1);
+        g->setTextSize(1);
+        g->setTextColor(s ? cW : cM);
+        g->setCursor(30, y + 25);
+        g->print(d.note);
+      }
+    }
+    flushCanvas();
+    return;
+  }
 
   if (nrfView == 1) {
     // ---------------- WATERFALL ----------------
@@ -3181,6 +3475,17 @@ void renderNRFSpectrum() {
     g->drawFastHLine(L, B, W, cM);
   }
 
+  // identification strip: coloured bar along the top edge of every detected signal (BARS and FALL)
+  if (nrfView != 2) {
+    for (int i = 0; i < nrfDevCount; i++) {
+      const NrfDev &d = nrfDev[i];
+      if (d.type == DEV_HOP) continue;                  // hoppers cover everything, no strip
+      int x0 = L + W * d.lo / NRF_CH;
+      int x1 = L + W * (d.hi + 1) / NRF_CH;
+      g->fillRect(x0, T, max(3, x1 - x0), 3, nrfDevColor(d.type));
+    }
+  }
+
   // frequency marker (BARS and FALL views)
   if (nrfCursor >= 0 && nrfView != 2) {
     int cx = L + (int)lroundf((float)W * (nrfCursor + 0.5f) / (float)NRF_CH);
@@ -3197,10 +3502,19 @@ void renderNRFSpectrum() {
       g->setTextColor(n - 1 == bestWifi ? themeColor(C_GREEN) : cW);
       g->setCursor(x, B + 6);
       g->print(s);
+
+      int aps = 0;                                      // number of access points the Wi-Fi scan saw on this channel
+      nrfSsidOn(n, aps);
+      if (aps > 0) {
+        String a = String(aps);
+        g->setTextColor(themeColor(C_CYAN));
+        g->setCursor(L + (n - 1) * bwAll + 1 + (bwAll - 2 - (int)a.length() * 6) / 2, B + 17);
+        g->print(a);
+      }
     }
     g->setTextColor(cM);
-    g->setCursor(L, 262);
-    g->print("Wi-Fi channel load");
+    g->setCursor(L, 270);
+    g->print("Load %  /  cyan = APs seen");
   } else {
     // Wi-Fi channel ticks: channel n is centred on nRF channel 7 + 5n
     for (int n = 1; n <= 13; n++) {
@@ -4877,7 +5191,7 @@ void loadSettings() {
   if (ledLevelIdx < 0 || ledLevelIdx > 4) ledLevelIdx = 2;
   if (customProto < 0 || customProto >= CUSTOM_PROTO_COUNT) customProto = 0;
   if (customRepeats < 0 || customRepeats > 3) customRepeats = 0;
-  if (nrfView > 2) nrfView = 0;
+  if (nrfView > 3) nrfView = 0;
   screenBrightness = brightLevels[configSelection];
 }
 
@@ -5002,7 +5316,7 @@ void nrf24Click() {
   } else if (subView == 1) {
     nrf24Ready = nrf24.isChipConnected();
   } else if (subView == 2) {
-    nrfView = (nrfView + 1) % 3;                     // BARS -> FALL -> WIFI
+    nrfView = (nrfView + 1) % 4;                     // BARS -> FALL -> WIFI -> DEVS
     saveSettings();
     uiDirty = true;
   }
@@ -5081,7 +5395,10 @@ void leavePageCleanup() {
     apStage = 0;
   }
   if (page == BLE_PAGE) { bleDetailView = false; bleStopAll(); }
-  if (page == NRF24_PAGE && nrf24Ready) nrf24.stopListening();
+  if (page == NRF24_PAGE) {
+    if (nrf24Ready) nrf24.stopListening();
+    if (wifiStarted) { WiFi.scanDelete(); wifiStarted = false; }   // drop a DEVS-view Wi-Fi scan that is still running
+  }
   if (page == IR_PAGE) irStop();
   if (page == VAULT_PAGE) vaultLeave();
   if (page == QR_PAGE) {
@@ -5274,7 +5591,7 @@ void pollJoystick() {
     }
   }
 
-  // NRF24 spectrum: stick up/down moves the frequency marker (down = towards 2483 MHz)
+  // NRF24 spectrum: stick up/down moves the frequency marker (down = towards 2483 MHz) or selects a signal in DEVS
   if (page == NRF24_PAGE && subView == 2 && yHeld && now - lastNavigation > 70) {
     lastNavigation = now;
     nrfMoveCursor(yd);
